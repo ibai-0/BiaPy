@@ -1,5 +1,23 @@
-import importlib
+"""
+This package (`biapy.models`) is responsible for building and managing deep learning models within the BiaPy framework.
+
+It provides functionalities to:
+
+1.  **Dynamically build models**: Select and instantiate various neural network architectures
+    (e.g., U-Net, ResUNet, ViT, ConvNeXt variants, etc.) based on configuration settings.
+2.  **Integrate with BioImage Model Zoo (BMZ)**: Facilitate the loading and compatibility
+    checking of pre-trained models from the BioImage Model Zoo, enabling easy reuse
+    of community-contributed models.
+3.  **Extract model source code**: Collect the necessary source code for a given model
+    and its dependencies, which is crucial for reproducibility and export functionalities.
+
+The module handles different problem types (e.g., semantic segmentation, super-resolution,
+classification) and adapts model configurations (e.g., 2D/3D, input/output channels,
+normalization, dropout) accordingly.
+"""
+from importlib import import_module
 import os
+import re
 import json
 from pathlib import Path
 import pooch
@@ -12,19 +30,22 @@ from typing import Optional, Dict, Tuple, List, Callable
 from packaging.version import Version
 from functools import partial
 from yacs.config import CfgNode as CN
+import numpy as np
+import ast
+import inspect
+from collections import deque, defaultdict
+from importlib import import_module, util
 
-from bioimageio.spec.utils import download
 from bioimageio.core.backends.pytorch_backend import load_torch_model
 from bioimageio.spec.model.v0_4 import ModelDescr as ModelDescr_v0_4
 from bioimageio.spec.model.v0_5 import ModelDescr as ModelDescr_v0_5
 from bioimageio.spec import InvalidDescr
 from bioimageio.core.digest_spec import get_test_inputs
 
-
-def build_model(cfg: CN, output_channels: int, device: torch.device) -> Tuple[nn.Module, str, Callable, Dict]:
+def build_model(cfg: CN, output_channels: int, device: torch.device) -> Tuple[nn.Module, str, Dict, set, List[str], Dict, Tuple[int, ...]]:
     # model, model_file, model_name, args
     """
-    Build selected model
+    Build selected model.
 
     Parameters
     ----------
@@ -46,14 +67,21 @@ def build_model(cfg: CN, output_channels: int, device: torch.device) -> Tuple[nn
     # Import the model
     if "efficientnet" in cfg.MODEL.ARCHITECTURE.lower():
         modelname = "efficientnet"
+    elif "hrnet" in cfg.MODEL.ARCHITECTURE.lower():
+        modelname = "hrnet"
     else:
         modelname = str(cfg.MODEL.ARCHITECTURE).lower()
-    mdl = importlib.import_module("biapy.models." + modelname)
+    mdl = import_module("biapy.models." + modelname)
     model_file = os.path.abspath(mdl.__file__)  # type: ignore
     names = [x for x in mdl.__dict__ if not x.startswith("_")]
     globals().update({k: getattr(mdl, k) for k in names})
 
     ndim = 3 if cfg.PROBLEM.NDIM == "3D" else 2
+    network_stride = None
+
+    # Put again the specific model name
+    if "hrnet" in cfg.MODEL.ARCHITECTURE.lower():
+        modelname = cfg.MODEL.ARCHITECTURE.lower()
 
     # Model building
     if modelname in [
@@ -76,6 +104,8 @@ def build_model(cfg: CN, output_channels: int, device: torch.device) -> Tuple[nn
             upsample_layer=cfg.MODEL.UPSAMPLE_LAYER,
             z_down=cfg.MODEL.Z_DOWN,
             output_channels=output_channels,
+            contrast=cfg.LOSS.CONTRAST.ENABLE, 
+            contrast_proj_dim=cfg.LOSS.CONTRAST.PROJ_DIM, 
         )
         if modelname == "unet":
             callable_model = U_Net  # type: ignore
@@ -126,18 +156,44 @@ def build_model(cfg: CN, output_channels: int, device: torch.device) -> Tuple[nn
         if cfg.PROBLEM.TYPE == "SUPER_RESOLUTION":
             args["upsampling_factor"] = cfg.PROBLEM.SUPER_RESOLUTION.UPSCALING
             args["upsampling_position"] = cfg.MODEL.UNET_SR_UPSAMPLE_POSITION
+
+        network_stride = [1,1] 
+        if ndim == 3:
+            network_stride = [1] + network_stride
         model = callable_model(**args)
+
+    elif "hrnet" in modelname:
+        args = dict(
+            image_shape=cfg.DATA.PATCH_SIZE,
+            normalization='sync_bn',
+            output_channels=output_channels,
+            contrast=cfg.LOSS.CONTRAST.ENABLE, 
+            contrast_proj_dim=cfg.LOSS.CONTRAST.PROJ_DIM, 
+        )
+
+        # Take the HRNet configuration from the cfg
+        _mod = modelname.upper()
+        _mod = re.sub(r'HRNET(\d+)', r'HRNET_\1', _mod)
+        _mod = _mod.replace("X", "_X")
+        args["cfg"] = getattr(cfg.MODEL, _mod)
+
+        callable_model = HighResolutionNet  # type: ignore
+        model = callable_model(**args)
+
+        network_stride = [4, 4]
+        if ndim == 3:
+            network_stride = [4 if args["cfg"].Z_DOWN else 1] + network_stride
     else:
         if modelname == "simple_cnn":
             args = dict(
                 image_shape=cfg.DATA.PATCH_SIZE,
                 activation=cfg.MODEL.ACTIVATION.lower(),
-                n_classes=cfg.MODEL.N_CLASSES,
+                n_classes=cfg.DATA.N_CLASSES,
             )
             model = simple_CNN(**args)  # type: ignore
             callable_model = simple_CNN  # type: ignore
         elif "efficientnet" in modelname:
-            args = dict(efficientnet_name=cfg.MODEL.ARCHITECTURE.lower(), n_classes=cfg.MODEL.N_CLASSES)
+            args = dict(efficientnet_name=cfg.MODEL.ARCHITECTURE.lower(), n_classes=cfg.DATA.N_CLASSES)
             model = efficientnet(**args)  # type: ignore
             callable_model = efficientnet  # type: ignore
         elif modelname == "vit":
@@ -146,7 +202,7 @@ def build_model(cfg: CN, output_channels: int, device: torch.device) -> Tuple[nn
                 patch_size=cfg.MODEL.VIT_TOKEN_SIZE,
                 in_chans=cfg.DATA.PATCH_SIZE[-1],
                 ndim=ndim,
-                num_classes=cfg.MODEL.N_CLASSES,
+                num_classes=cfg.DATA.N_CLASSES,
                 norm_layer=partial(nn.LayerNorm, eps=1e-6),
             )
             if cfg.MODEL.VIT_MODEL == "custom":
@@ -278,6 +334,7 @@ def build_model(cfg: CN, output_channels: int, device: torch.device) -> Tuple[nn
             cfg.DATA.PATCH_SIZE[1],
             cfg.DATA.PATCH_SIZE[2],
         )
+
     summary(
         model,
         input_size=sample_size,
@@ -286,10 +343,197 @@ def build_model(cfg: CN, output_channels: int, device: torch.device) -> Tuple[nn
         device=device.type,
     )
 
-    model_file += ":" + str(callable_model.__name__)
-    model_name = model_file.rsplit(":", 1)[-1]
-    return model, model_file, model_name, args
+    # Queue for recursive dependency tracing
+    dependency_queue = deque()
+    dependency_queue.append(callable_model)
 
+    collected_sources, all_import_lines, scanned_files = extract_model(dependency_queue, model_file)
+    all_import_lines = merge_import_lines(all_import_lines)
+
+    return model, str(callable_model.__name__), collected_sources, all_import_lines, scanned_files, args, network_stride # type: ignore
+
+def extract_model(dependency_queue: deque, model_file: str) -> Tuple[Dict[str, str], set, List[str]]:
+    """
+    Extract the source code of the model and its dependencies.
+
+    Parameters  
+    ----------  
+    dependency_queue : deque
+        Queue of model dependencies to be processed.
+
+    model_file : str    
+        Path to the main model file.
+
+    Returns 
+    -------
+    collected_sources : dict
+        Dictionary containing the source code of the collected model dependencies.
+
+    all_import_lines : set  
+        Set of all import lines found in the model and its dependencies.
+
+    scanned_files : list
+        List of all files that were scanned for dependencies.
+    """
+    visited_files = set()
+    visited_names = set()
+    collected_sources = {}
+    all_import_lines = set()
+    scanned_files = []
+    queue = [model_file]
+
+    # {name: source_code} for all class/function definitions
+    name_to_source: Dict[str, str] = {}
+
+    # === Step 1: Scan all relevant files and build name → source map ===
+    while queue:
+        filepath = os.path.abspath(queue.pop())
+        if filepath in visited_files:
+            continue
+        visited_files.add(filepath)
+        scanned_files.append(filepath)
+
+        with open(filepath, "r") as f:
+            source_lines = f.readlines()
+        source_text = "".join(source_lines)
+        tree = ast.parse(source_text, filename=filepath)
+
+        biapy_module_names = set()
+
+        for node in ast.walk(tree):
+            # Import parsing
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    mod = alias.name
+                    full = f"import {mod}" + (f" as {alias.asname}" if alias.asname else "")
+                    if mod.startswith("biapy"):
+                        biapy_module_names.add(mod)
+                    else:
+                        all_import_lines.add(full)
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module
+                if not mod:
+                    continue
+                names = ", ".join(
+                    f"{alias.name}" + (f" as {alias.asname}" if alias.asname else "")
+                    for alias in node.names
+                )
+                full = f"from {mod} import {names}"
+                if mod.startswith("biapy"):
+                    biapy_module_names.add(mod)
+                else:
+                    all_import_lines.add(full)
+
+        # Extract all top-level classes and functions and map name → source
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                name = node.name
+                start_line = node.lineno - 1
+                # Try to find the end of the block
+                end_line = start_line + 1
+                indent = len(source_lines[start_line]) - len(source_lines[start_line].lstrip())
+
+                while end_line < len(source_lines):
+                    line_indent = len(source_lines[end_line]) - len(source_lines[end_line].lstrip())
+                    if source_lines[end_line].strip() and line_indent <= indent:
+                        break
+                    end_line += 1
+
+                name_to_source[name] = "".join(source_lines[start_line:end_line])
+
+        # Follow BiaPy module imports (if file-based)
+        for name in biapy_module_names:
+            try:
+                from importlib.util import find_spec
+                spec = find_spec(name)
+                if spec and spec.origin and os.path.isfile(spec.origin):
+                    queue.append(spec.origin)
+            except Exception as e:
+                print(f"Warning: Failed to resolve {name}: {e}")
+
+    # === Step 2: Traverse dependency tree ===
+    class NameVisitor(ast.NodeVisitor):
+        def __init__(self):
+            self.names = set()
+
+        def visit_Name(self, node):
+            self.names.add(node.id)
+            self.generic_visit(node)
+
+        def visit_Attribute(self, node):
+            if isinstance(node.value, ast.Name):
+                self.names.add(node.value.id)
+            self.generic_visit(node)
+
+    while dependency_queue:
+        obj = dependency_queue.popleft()
+        name = obj.__name__
+        if name in visited_names:
+            continue
+        visited_names.add(name)
+
+        source = name_to_source.get(name)
+        if not source:
+            print(f"Warning: Source not found for {name}")
+            continue
+
+        collected_sources[name] = source
+
+        # Find dependencies
+        visitor = NameVisitor()
+        visitor.visit(ast.parse(source))
+
+        for dep_name in visitor.names:
+            if dep_name not in visited_names and dep_name in name_to_source:
+                class FakeObject:
+                    def __init__(self, __name__):
+                        self.__name__ = __name__
+                dependency_queue.append(FakeObject(dep_name))
+
+    return collected_sources, sorted(all_import_lines), scanned_files
+
+def merge_import_lines(import_lines: List[str]) -> List[str]:
+    """
+    Merge import lines by grouping them by module and sorting names within each module.
+
+    Parameters
+    ----------
+    import_lines : list of str
+        List of import lines to be merged.
+
+    Returns
+    -------
+    merged : list of str
+        Merged import lines, sorted and grouped by module.
+    """
+    grouped = defaultdict(set)
+    standalone_imports = set()
+
+    for line in import_lines:
+        line = line.strip()
+        if line.startswith("import "):
+            # Regular import, keep it as-is
+            standalone_imports.add(line)
+        elif line.startswith("from "):
+            try:
+                parts = line.split(" import ")
+                mod = parts[0][5:].strip()  # remove "from "
+                names = parts[1].split(",")
+                for name in names:
+                    grouped[mod].add(name.strip())
+            except Exception as e:
+                print(f"Warning: could not parse import line '{line}': {e}")
+        else:
+            standalone_imports.add(line)
+
+    merged = []
+
+    for mod, names in grouped.items():
+        sorted_names = sorted(names)
+        merged.append(f"from {mod} import {', '.join(sorted_names)}")
+
+    merged.extend(sorted(standalone_imports))
+    return sorted(merged)
 
 def build_bmz_model(cfg: CN, model: ModelDescr_v0_4 | ModelDescr_v0_5, device: torch.device) -> nn.Module:
     """
@@ -393,7 +637,7 @@ def check_bmz_args(
     workflow_specs = {}
     workflow_specs["workflow_type"] = cfg.PROBLEM.TYPE
     workflow_specs["ndim"] = cfg.PROBLEM.NDIM
-    workflow_specs["nclasses"] = cfg.MODEL.N_CLASSES
+    workflow_specs["nclasses"] = cfg.DATA.N_CLASSES
 
     preproc_info, error, error_message = check_bmz_model_compatibility(model_rdf, workflow_specs=workflow_specs)
 
@@ -408,8 +652,7 @@ def check_bmz_model_compatibility(
     workflow_specs: Optional[Dict] = None,
 ) -> Tuple[List, bool, str]:
     """
-    Checks one model compatibility with BiaPy by looking at its RDF file provided by BMZ. This function is the one
-    used in BMZ's continuous integration with BiaPy.
+    Check one model compatibility with BiaPy by looking at its RDF file provided by BMZ. This function is the one used in BMZ's continuous integration with BiaPy.
 
     Parameters
     ----------
@@ -483,14 +726,14 @@ def check_bmz_model_compatibility(
 
             if not isinstance(classes, int):
                 reason_message = (
-                    f"[{specific_workflow}] 'MODEL.N_CLASSES' not extracted. Obtained {classes}. Please check it!\n"
+                    f"[{specific_workflow}] 'DATA.N_CLASSES' not extracted. Obtained {classes}. Please check it!\n"
                 )
                 return preproc_info, True, reason_message
 
             if isinstance(classes, int) and classes != -1:
                 if ref_classes != "all":
                     if classes > 2 and ref_classes != classes:
-                        reason_message = f"[{specific_workflow}] 'MODEL.N_CLASSES' does not match network's output classes. Please check it!\n"
+                        reason_message = f"[{specific_workflow}] 'DATA.N_CLASSES' does not match network's output classes. Please check it!\n"
                         return preproc_info, True, reason_message
             else:
                 reason_message = f"[{specific_workflow}] Couldn't find the classes this model is returning so please be aware to match it\n"
@@ -503,7 +746,10 @@ def check_bmz_model_compatibility(
             pass
         elif specific_workflow in ["all", "DENOISING"] and "denoising" in model_rdf["tags"]:
             pass
-        elif specific_workflow in ["all", "SUPER_RESOLUTION"] and "super-resolution" in model_rdf["tags"]:
+        elif specific_workflow in ["all", "SUPER_RESOLUTION"] and (
+            "super-resolution" in model_rdf["tags"]
+            or "superresolution" in model_rdf["tags"]
+        ):
             pass
         elif specific_workflow in ["all", "SELF_SUPERVISED"] and "self-supervision" in model_rdf["tags"]:
             pass
@@ -615,7 +861,7 @@ def check_bmz_model_compatibility(
 
 def check_model_restrictions(cfg: CN, bmz_config: Dict, workflow_specs: Dict) -> List[str]:
     """
-    Checks model restrictions to be applied into the current configuration.
+    Check model restrictions to be applied into the current configuration.
 
     Parameters
     ----------
@@ -689,7 +935,7 @@ def check_model_restrictions(cfg: CN, bmz_config: Dict, workflow_specs: Dict) ->
         if classes == -1:
             raise ValueError("Classes not found for semantic segmentation dir.")
 
-        opts["MODEL.N_CLASSES"] = max(2, classes)
+        opts["DATA.N_CLASSES"] = max(2, classes)
 
     elif specific_workflow in ["INSTANCE_SEG"]:
         # Assumed it's BC. This needs a more elaborated process. Still deciding this:
@@ -735,7 +981,7 @@ def check_model_restrictions(cfg: CN, bmz_config: Dict, workflow_specs: Dict) ->
             1,
         ] * channels
         if classes != 2:
-            opts["MODEL.N_CLASSES"] = max(2, classes)
+            opts["DATA.N_CLASSES"] = max(2, classes)
         if channel_code == "A":
             opts["LOSS.CLASS_REBALANCE"] = True
 
@@ -792,6 +1038,34 @@ def check_model_restrictions(cfg: CN, bmz_config: Dict, workflow_specs: Dict) ->
 
 
 def get_cfg_key_value(obj, attr, *args):
+    """
+    Recursively retrieve a nested attribute value from an object (e.g., a YACS CfgNode).
+
+    This function allows accessing values from nested configuration objects
+    or any object with attributes, by providing a dot-separated string for the
+    attribute path. It's particularly useful for navigating `CfgNode` objects.
+
+    Parameters
+    ----------
+    obj : object
+        The base object from which to start attribute retrieval.
+    attr : str
+        A dot-separated string representing the path to the desired attribute
+        (e.g., "MODEL.ARCHITECTURE", "DATA.PATCH_SIZE.0").
+    *args
+        Optional arguments to pass to `getattr` for default values if an
+        attribute is not found. If provided, `getattr(obj, name, *args)` is used.
+
+    Returns
+    -------
+    any
+        The value of the nested attribute.
+
+    Raises
+    ------
+    AttributeError
+        If an attribute in the path does not exist and no default value is provided.
+    """
     def _getattr(obj, attr):
         return getattr(obj, attr, *args)
 
@@ -799,21 +1073,77 @@ def get_cfg_key_value(obj, attr, *args):
 
 
 def build_torchvision_model(cfg: CN, device: torch.device) -> Tuple[nn.Module, Callable]:
+    """
+    Build and adapt a model from the `torchvision.models` library based on the configuration.
+
+    This function dynamically loads a pre-trained model from `torchvision.models`
+    (e.g., ResNet, DeepLabV3, MaskRCNN, etc.) as specified in the configuration.
+    It then adapts the final output layer(s) of the model to match the number of
+    classes or output channels required by the specific problem type (e.g.,
+    classification, semantic segmentation, instance segmentation).
+
+    Parameters
+    ----------
+    cfg : YACS CN object
+        The configuration object. Key parameters used are:
+
+        - `cfg.MODEL.TORCHVISION_MODEL_NAME`: Name of the torchvision model to load
+          (e.g., "resnet50", "deeplabv3_resnet101", "maskrcnn_resnet50_fpn", "quantized_resnet50").
+        - `cfg.PROBLEM.TYPE`: Type of problem (e.g., "CLASSIFICATION", "SEMANTIC_SEG",
+          "INSTANCE_SEG", "DETECTION") to determine model adaptation logic.
+        - `cfg.DATA.N_CLASSES`: Number of output classes required for the problem.
+        - `cfg.DATA.PATCH_SIZE`: Input patch size, used for generating the model summary.
+        - `cfg.PROBLEM.NDIM`: Number of input dimensions ("2D" or "3D").
+
+    device : torch.device
+        The PyTorch device (e.g., "cpu", "cuda", "mps") on which the model
+        will be loaded and run.
+
+    Returns
+    -------
+    model : nn.Module
+        The instantiated and adapted PyTorch model from torchvision.
+    transforms : Callable
+        A callable representing the default preprocessing transforms associated
+        with the loaded torchvision model's weights. This should be applied to
+        input images before feeding them to the model.
+
+    Notes
+    -----
+    - Models are loaded with their `DEFAULT` pre-trained weights from torchvision.
+    - The final layer adaptation logic is specific to common torchvision model
+      structures for classification, semantic segmentation, and instance segmentation.
+    - For classification, the final linear layer is replaced. A warning is printed
+      if the number of classes differs from ImageNet's default (1000).
+    - For semantic segmentation, the final convolutional layer(s) of the classifier
+      and auxiliary classifier (if present) are replaced. A warning is printed
+      if the number of classes differs from Pascal VOC's default (21).
+    - For instance segmentation (MaskRCNN), the box predictor's classification
+      score head and the mask predictor's final convolutional layer are replaced.
+      A warning is printed if the number of classes differs from COCO's default (91).
+    - Special handling is included for `squeezenet` and `lraspp_mobilenet_v3_large`
+      due to their unique head structures.
+    - For `maxvit_t` in classification, a fixed sample input size of (1, 3, 224, 224)
+      is used for the model summary.
+    - This function assumes the necessary `torchvision` models and their default
+      weights are installed and accessible.
+      
+    """
     # Find model in TorchVision
     if "quantized_" in cfg.MODEL.TORCHVISION_MODEL_NAME:
-        mdl = importlib.import_module("torchvision.models.quantization", cfg.MODEL.TORCHVISION_MODEL_NAME)
+        mdl = import_module("torchvision.models.quantization", cfg.MODEL.TORCHVISION_MODEL_NAME)
         w_prefix = "_quantizedweights"
         tc_model_name = cfg.MODEL.TORCHVISION_MODEL_NAME.replace("quantized_", "")
-        mdl_weigths = importlib.import_module("torchvision.models", cfg.MODEL.TORCHVISION_MODEL_NAME)
+        mdl_weigths = import_module("torchvision.models", cfg.MODEL.TORCHVISION_MODEL_NAME)
     else:
         w_prefix = "_weights"
         tc_model_name = cfg.MODEL.TORCHVISION_MODEL_NAME
         if cfg.PROBLEM.TYPE == "CLASSIFICATION":
-            mdl = importlib.import_module("torchvision.models", cfg.MODEL.TORCHVISION_MODEL_NAME)
+            mdl = import_module("torchvision.models", cfg.MODEL.TORCHVISION_MODEL_NAME)
         elif cfg.PROBLEM.TYPE == "SEMANTIC_SEG":
-            mdl = importlib.import_module("torchvision.models.segmentation", cfg.MODEL.TORCHVISION_MODEL_NAME)
+            mdl = import_module("torchvision.models.segmentation", cfg.MODEL.TORCHVISION_MODEL_NAME)
         elif cfg.PROBLEM.TYPE in ["INSTANCE_SEG", "DETECTION"]:
-            mdl = importlib.import_module("torchvision.models.detection", cfg.MODEL.TORCHVISION_MODEL_NAME)
+            mdl = import_module("torchvision.models.detection", cfg.MODEL.TORCHVISION_MODEL_NAME)
         mdl_weigths = mdl
 
     # Import model and weights
@@ -836,10 +1166,10 @@ def build_torchvision_model(cfg: CN, device: torch.device) -> Tuple[nn.Module, C
 
     # Create new head
     sample_size = None
-    out_classes = cfg.MODEL.N_CLASSES if cfg.MODEL.N_CLASSES > 2 else 1
+    out_classes = cfg.DATA.N_CLASSES if cfg.DATA.N_CLASSES > 2 else 1
     if cfg.PROBLEM.TYPE == "CLASSIFICATION":
         if (
-            cfg.MODEL.N_CLASSES != 1000
+            cfg.DATA.N_CLASSES != 1000
         ):  # 1000 classes are the ones by default in ImageNet, which are the weights loaded by default
             print(
                 f"WARNING: Model's head changed from 1000 to {out_classes} so a finetunning is required to have good results"
@@ -872,7 +1202,7 @@ def build_torchvision_model(cfg: CN, device: torch.device) -> Tuple[nn.Module, C
             if cfg.MODEL.TORCHVISION_MODEL_NAME in ["maxvit_t"]:
                 sample_size = (1, 3, 224, 224)
     elif cfg.PROBLEM.TYPE == "SEMANTIC_SEG":
-        if cfg.MODEL.N_CLASSES != 21:
+        if cfg.DATA.N_CLASSES != 21:
             print(
                 f"WARNING: Model's head changed from 21 to {out_classes} so a finetunning is required to have good results"
             )
@@ -889,7 +1219,7 @@ def build_torchvision_model(cfg: CN, device: torch.device) -> Tuple[nn.Module, C
 
     elif cfg.PROBLEM.TYPE == "INSTANCE_SEG":
         # MaskRCNN
-        if cfg.MODEL.N_CLASSES != 91:  # 91 classes are the ones by default in MaskRCNN
+        if cfg.DATA.N_CLASSES != 91:  # 91 classes are the ones by default in MaskRCNN
             cls_score = torch.nn.Linear(in_features=1024, out_features=out_classes, bias=True)
             model.roi_heads.box_predictor.cls_score = cls_score
             mask_fcn_logits = torch.nn.Conv2d(

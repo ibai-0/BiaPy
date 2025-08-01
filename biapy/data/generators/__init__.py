@@ -1,3 +1,11 @@
+"""
+BiaPy data generators package.
+
+This package provides data generator classes and utility functions for loading,
+augmenting, and batching image and mask data for deep learning workflows in BiaPy.
+It supports 2D and 3D data, chunked loading, distributed training, and advanced
+augmentation pipelines.
+"""
 import os
 from typing import List, Dict, Any, Tuple, Optional
 from torch.utils.data import (
@@ -71,7 +79,6 @@ def create_train_val_augmentors(
     num_training_steps_per_epoch: int
         Number of training steps per epoch.
     """
-
     # Calculate the probability map per image
     prob_map = None
     if cfg.DATA.PROBABILITY_MAP and cfg.DATA.EXTRACT_RANDOM_PATCH:
@@ -248,8 +255,8 @@ def create_train_val_augmentors(
             resolution=cfg.DATA.TRAIN.RESOLUTION,
             random_crops_in_DA=cfg.DATA.EXTRACT_RANDOM_PATCH,
             prob_map=prob_map,
-            n_classes=cfg.MODEL.N_CLASSES,
-            ignore_index=None if not cfg.LOSS.IGNORE_VALUES else cfg.LOSS.VALUE_TO_IGNORE,
+            n_classes=cfg.DATA.N_CLASSES,
+            ignore_index=cfg.LOSS.IGNORE_INDEX,
             extra_data_factor=cfg.DATA.TRAIN.REPLICATE,
             norm_module=norm_module,
             random_crop_scale=cfg.PROBLEM.SUPER_RESOLUTION.UPSCALING,
@@ -299,8 +306,8 @@ def create_train_val_augmentors(
             shape=cfg.DATA.PATCH_SIZE,
             random_crops_in_DA=cfg.DATA.EXTRACT_RANDOM_PATCH,
             val=True,
-            n_classes=cfg.MODEL.N_CLASSES,
-            ignore_index=None if not cfg.LOSS.IGNORE_VALUES else cfg.LOSS.VALUE_TO_IGNORE,
+            n_classes=cfg.DATA.N_CLASSES,
+            ignore_index=cfg.LOSS.IGNORE_INDEX,
             seed=cfg.SYSTEM.SEED,
             norm_module=norm_module,
             resolution=cfg.DATA.VAL.RESOLUTION,
@@ -479,8 +486,8 @@ def create_test_generator(
         dic["Y"] = Y_test
         dic["test_by_chunks"] = cfg.TEST.BY_CHUNKS.ENABLE
         dic["instance_problem"] = cfg.PROBLEM.TYPE == "INSTANCE_SEG"
-        dic["ignore_index"] = None if not cfg.LOSS.IGNORE_VALUES else cfg.LOSS.VALUE_TO_IGNORE
-        dic["n_classes"] = cfg.MODEL.N_CLASSES
+        dic["ignore_index"] = cfg.LOSS.IGNORE_INDEX
+        dic["n_classes"] = cfg.DATA.N_CLASSES
     
     test_generator = gen_name(**dic)
     data_norm = test_generator.get_data_normalization()
@@ -552,7 +559,30 @@ def create_chunked_test_generator(
     dtype_str: str,
 ) -> DataLoader:
     """
-    Creates a chunked test generator.
+    Create a DataLoader for chunked test data using chunked_test_pair_data_generator.
+
+    This function sets up a generator for efficient inference on large volumetric datasets
+    by processing data in chunks. It configures the generator with the appropriate axes,
+    patch size, padding, and normalization, and wraps it in a PyTorch DataLoader with
+    optimal worker settings for distributed or single-GPU environments.
+
+    Parameters
+    ----------
+    cfg : CN
+        BiaPy configuration node.
+    current_sample : dict
+        Dictionary containing the sample to process (e.g., file pointers, data arrays).
+    norm_module : Normalization
+        Normalization module to apply to the data.
+    out_dir : str
+        Output directory to save results.
+    dtype_str : str
+        Data type string for output files.
+
+    Returns
+    -------
+    test_dataset : DataLoader
+        PyTorch DataLoader wrapping the chunked test data generator.
     """
     chunked_generator = chunked_test_pair_data_generator(
         sample_to_process=current_sample,
@@ -563,8 +593,8 @@ def create_chunked_test_generator(
         padding=cfg.DATA.TEST.PADDING,
         out_dir=out_dir,
         dtype_str=dtype_str,
-        n_classes=cfg.MODEL.N_CLASSES,
-        ignore_index=None if not cfg.LOSS.IGNORE_VALUES else cfg.LOSS.VALUE_TO_IGNORE,
+        n_classes=cfg.DATA.N_CLASSES,
+        ignore_index=cfg.LOSS.IGNORE_INDEX,
         instance_problem = cfg.PROBLEM.TYPE == "INSTANCE_SEG",
     )
 
@@ -611,7 +641,6 @@ def check_generator_consistence(
     Filenames : List, optional
         Filenames that should be used when saving each image.
     """
-
     print("Check generator . . .")
     it = iter(gen)
 
@@ -638,7 +667,24 @@ def check_generator_consistence(
 # epochs, the first iteration of every new epoch is as fast as the iterations in the middle
 # of an epoch.
 class MultiEpochsDataLoader(DataLoader):
+    """
+    DataLoader that reuses workers across epochs for faster first-batch loading.
+
+    This class avoids the slow first batch at the start of every epoch by keeping
+    worker processes alive, improving training speed in PyTorch.
+    """
+
     def __init__(self, *args, **kwargs):
+        """
+        Initialize the MultiEpochsDataLoader.
+
+        Parameters
+        ----------
+        *args : tuple
+            Arguments passed to the standard DataLoader.
+        **kwargs : dict
+            Keyword arguments passed to the standard DataLoader.
+        """
         super().__init__(*args, **kwargs)
         self._DataLoader__initialized = False
         self.batch_sampler = _RepeatSampler(self.batch_sampler)
@@ -646,9 +692,25 @@ class MultiEpochsDataLoader(DataLoader):
         self.iterator = super().__iter__()
 
     def __len__(self):
+        """
+        Return the number of batches.
+
+        Returns
+        -------
+        int
+            Number of batches in the dataset.
+        """
         return len(self.batch_sampler.sampler)  # type: ignore
 
     def __iter__(self):
+        """
+        Iterate over the batches.
+
+        Yields
+        ------
+        batch : Any
+            Next batch from the iterator.
+        """
         for i in range(len(self)):
             yield next(self.iterator)
 

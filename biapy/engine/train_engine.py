@@ -1,3 +1,10 @@
+"""
+Training and evaluation engine for BiaPy.
+
+This module provides functions to train and evaluate deep learning models for
+one epoch, handling distributed training, logging, learning rate scheduling,
+and memory bank operations for contrastive/self-supervised learning.
+"""
 import torch
 import math
 import sys
@@ -11,6 +18,7 @@ from biapy.utils.misc import MetricLogger, SmoothedValue, TensorboardLogger, all
 from biapy.engine import Scheduler
 from torch.optim.lr_scheduler import ReduceLROnPlateau, OneCycleLR
 from biapy.engine.schedulers.warmup_cosine_decay import WarmUpCosineDecayScheduler
+from biapy.models.memory_bank import MemoryBank
 
 
 def train_one_epoch(
@@ -27,14 +35,66 @@ def train_one_epoch(
     log_writer: Optional[TensorboardLogger] = None,
     lr_scheduler: Optional[Scheduler] = None,
     verbose: bool = False,
+    memory_bank: Optional[MemoryBank] = None,
+    total_iters: int=0,
+    contrast_warmup_iters: int=0,
 ):
+    """
+    Train the model for one epoch.
 
+    Handles forward and backward passes, loss computation, metric logging,
+    optimizer steps, learning rate scheduling, and optional memory bank updates.
+
+    Parameters
+    ----------
+    cfg : CN
+        BiaPy configuration node.
+    model : nn.Module or nn.parallel.DistributedDataParallel
+        Model to train.
+    model_call_func : Callable
+        Function to call the model (handles multi-heads, etc.).
+    loss_function : Callable
+        Loss function.
+    metric_function : Callable
+        Metric computation function.
+    prepare_targets : Callable
+        Function to prepare targets for loss/metrics.
+    data_loader : DataLoader
+        Training data loader.
+    optimizer : Optimizer
+        Optimizer for model parameters.
+    device : torch.device
+        Device to use.
+    epoch : int
+        Current epoch number.
+    log_writer : TensorboardLogger, optional
+        Logger for TensorBoard.
+    lr_scheduler : Scheduler, optional
+        Learning rate scheduler.
+    verbose : bool, optional
+        Verbosity flag.
+    memory_bank : MemoryBank, optional
+        Memory bank for contrastive/self-supervised learning.
+    total_iters : int, optional
+        Total iterations completed (for contrastive warmup).
+    contrast_warmup_iters : int, optional
+        Number of warmup iterations for contrastive learning.
+
+    Returns
+    -------
+    dict
+        Dictionary of averaged metrics for the epoch.
+    int
+        Number of steps (batches) processed.
+    """
+    # Switch to training mode
     model.train(True)
 
     # Ensure correct order of each epoch info by adding loss first
     metric_logger = MetricLogger(delimiter="  ", verbose=verbose)
     metric_logger.add_meter("loss", SmoothedValue())
 
+    # Set up the header for logging
     header = "Epoch: [{}]".format(epoch + 1)
     print_freq = 10
 
@@ -63,7 +123,29 @@ def train_one_epoch(
 
         # Pass the images through the model
         outputs = model_call_func(batch, is_train=True)
-        loss = loss_function(outputs, targets)
+
+        # Loss function call
+        if memory_bank is not None:
+            if total_iters + step >= contrast_warmup_iters:
+                with_embed = True
+            else:
+                with_embed = False
+
+            outputs = {
+                "pred": outputs["pred"],
+                "embed": outputs["embed"],
+                'key': outputs["embed"].detach(),
+                'pixel_queue': memory_bank.pixel_queue,
+                'segment_queue': memory_bank.segment_queue,
+            }
+
+            loss = loss_function(outputs, targets, with_embed=with_embed)
+
+            memory_bank.dequeue_and_enqueue(
+                outputs['key'], targets.detach(),
+            )
+        else:
+            loss = loss_function(outputs, targets)
 
         loss_value = loss.item()
         if not math.isfinite(loss_value):
@@ -104,7 +186,7 @@ def train_one_epoch(
     # Gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("[Train] averaged stats:", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, step
 
 
 @torch.no_grad()
@@ -118,8 +200,42 @@ def evaluate(
     epoch: int,
     data_loader: DataLoader,
     lr_scheduler: Optional[Scheduler] = None,
+    memory_bank: Optional[MemoryBank] = None,
 ):
+    """
+    Evaluate the model on the validation set.
 
+    Runs the model in evaluation mode, computes loss and metrics, and updates
+    learning rate scheduler if needed.
+
+    Parameters
+    ----------
+    cfg : CN
+        BiaPy configuration node.
+    model : nn.Module or nn.parallel.DistributedDataParallel
+        Model to evaluate.
+    model_call_func : Callable
+        Function to call the model.
+    loss_function : Callable
+        Loss function.
+    metric_function : Callable
+        Metric computation function.
+    prepare_targets : Callable
+        Function to prepare targets for loss/metrics.
+    epoch : int
+        Current epoch number.
+    data_loader : DataLoader
+        Validation data loader.
+    lr_scheduler : Scheduler, optional
+        Learning rate scheduler.
+    memory_bank : MemoryBank, optional
+        Memory bank for contrastive/self-supervised learning.
+
+    Returns
+    -------
+    dict
+        Dictionary of averaged metrics for the validation set.
+    """
     # Ensure correct order of each epoch info by adding loss first
     metric_logger = MetricLogger(delimiter="  ")
     metric_logger.add_meter("loss", SmoothedValue())
@@ -136,7 +252,22 @@ def evaluate(
 
         # Pass the images through the model
         outputs = model_call_func(images, is_train=True)
-        loss = loss_function(outputs, targets)
+        
+        # Loss function call
+        if memory_bank is not None:
+            with_embed = False
+
+            outputs = {
+                "pred": outputs["pred"],
+                "embed": outputs["embed"],
+                'key': outputs["pred"].detach(),
+                'pixel_queue': memory_bank.pixel_queue,
+                'segment_queue': memory_bank.segment_queue,
+            }
+
+            loss = loss_function(outputs, targets, with_embed=with_embed)
+        else:
+            loss = loss_function(outputs, targets)
 
         # Calculate the metrics
         metric_function(outputs, targets, metric_logger=metric_logger)

@@ -1,3 +1,11 @@
+"""
+Classification workflow for BiaPy.
+
+This module defines the Classification_Workflow class, which implements the
+training, validation, and inference pipeline for image classification tasks in BiaPy.
+It handles data loading, model setup, metrics, predictions, and result saving for
+single-label classification problems.
+"""
 import os
 import torch
 import math
@@ -13,12 +21,13 @@ from biapy.engine.base_workflow import Base_Workflow
 from biapy.data.pre_processing import preprocess_data
 from biapy.data.data_manipulation import load_and_prepare_train_data_cls, load_and_prepare_cls_test_data
 from biapy.utils.misc import is_main_process, MetricLogger
-from biapy.data.dataset import PatchCoords
+from biapy.engine.metrics import loss_encapsulation
 
 
 class Classification_Workflow(Base_Workflow):
     """
     Classification workflow where the goal of this workflow is to assing a label to the input image.
+
     More details in `our documentation <https://biapy.readthedocs.io/en/latest/workflows/classification.html>`_.
 
     Parameters
@@ -37,6 +46,25 @@ class Classification_Workflow(Base_Workflow):
     """
 
     def __init__(self, cfg, job_identifier, device, args, **kwargs):
+        """
+        Initialize the Classification_Workflow.
+
+        Sets up configuration, device, job identifier, and initializes
+        workflow-specific attributes for classification tasks.
+
+        Parameters
+        ----------
+        cfg : YACS configuration
+            Running configuration.
+        job_identifier : str
+            Complete name of the running job.
+        device : torch.device
+            Device used.
+        args : argparse.Namespace
+            Arguments used in BiaPy's call.
+        **kwargs : dict
+            Additional keyword arguments.
+        """
         super(Classification_Workflow, self).__init__(cfg, job_identifier, device, args, **kwargs)
         self.all_pred = []
         if self.cfg.DATA.TEST.LOAD_GT:
@@ -54,6 +82,8 @@ class Classification_Workflow(Base_Workflow):
 
     def define_activations_and_channels(self):
         """
+        Define the activations and output channels of the model.
+
         This function must define the following variables:
 
         self.model_output_channels : List of functions
@@ -70,8 +100,9 @@ class Classification_Workflow(Base_Workflow):
         """
         self.model_output_channels = {
             "type": "mask",
-            "channels": [self.cfg.MODEL.N_CLASSES],
+            "channels": [self.cfg.DATA.N_CLASSES],
         }
+        self.real_classes = self.model_output_channels["channels"][0]
         self.multihead = False
         self.activations = [{":": "Linear"}]
 
@@ -79,6 +110,8 @@ class Classification_Workflow(Base_Workflow):
 
     def define_metrics(self):
         """
+        Define the metrics to be used during training and test/inference.
+
         This function must define the following variables:
 
         self.train_metrics : List of functions
@@ -105,13 +138,13 @@ class Classification_Workflow(Base_Workflow):
         for metric in list(set(self.cfg.TRAIN.METRICS)):
             if metric == "accuracy":
                 self.train_metrics.append(
-                    Accuracy(task="multiclass", num_classes=self.cfg.MODEL.N_CLASSES).to(self.device),
+                    Accuracy(task="multiclass", num_classes=self.cfg.DATA.N_CLASSES).to(self.device),
                 )
                 self.train_metric_names.append("Accuracy")
                 self.train_metric_best.append("max")
-            elif metric == "top-5-accuracy" and self.cfg.MODEL.N_CLASSES > 5:
+            elif metric == "top-5-accuracy" and self.cfg.DATA.N_CLASSES > 5:
                 self.train_metrics.append(
-                    Accuracy(task="multiclass", num_classes=self.cfg.MODEL.N_CLASSES, top_k=5).to(self.device),
+                    Accuracy(task="multiclass", num_classes=self.cfg.DATA.N_CLASSES, top_k=5).to(self.device),
                 )
                 self.train_metric_names.append("Top 5 accuracy")
                 self.train_metric_best.append("max")
@@ -129,7 +162,7 @@ class Classification_Workflow(Base_Workflow):
         self.test_metric_names.append("Confusion matrix")
 
         if self.cfg.LOSS.TYPE == "CE":
-            self.loss = torch.nn.CrossEntropyLoss()
+            self.loss = loss_encapsulation(torch.nn.CrossEntropyLoss())
 
         super().define_metrics()
 
@@ -141,7 +174,7 @@ class Classification_Workflow(Base_Workflow):
         metric_logger: Optional[MetricLogger] = None,
     ) -> Dict:
         """
-        Execution of the metrics defined in :func:`~define_metrics` function.
+        Execute the calculation of metrics defined in :func:`~define_metrics` function.
 
         Parameters
         ----------
@@ -168,6 +201,8 @@ class Classification_Workflow(Base_Workflow):
 
         with torch.no_grad():
             for i, metric in enumerate(list_to_use):
+                if isinstance(output, dict):
+                    output = output["pred"]
                 val = metric(output, targets)
                 if torch.is_tensor(val):
                     val = val.item() if not torch.isnan(val) else 0
@@ -179,8 +214,7 @@ class Classification_Workflow(Base_Workflow):
 
     def prepare_targets(self, targets, batch):
         """
-        Location to perform any necessary data transformations to ``targets``
-        before calculating the loss.
+        Perform any necessary data transformations to ``targets`` before calculating the loss.
 
         Parameters
         ----------
@@ -198,9 +232,7 @@ class Classification_Workflow(Base_Workflow):
         return targets.to(self.device, non_blocking=True)
 
     def load_train_data(self):
-        """
-        Load training and validation data.
-        """
+        """Load training and validation data."""
         (
             self.X_train,
             self.X_val,
@@ -210,7 +242,7 @@ class Classification_Workflow(Base_Workflow):
             train_in_memory=self.cfg.DATA.TRAIN.IN_MEMORY,
             val_path=self.cfg.DATA.VAL.PATH,
             val_in_memory=self.cfg.DATA.VAL.IN_MEMORY,
-            expected_classes=self.cfg.MODEL.N_CLASSES,
+            expected_classes=self.cfg.DATA.N_CLASSES,
             cross_val=self.cfg.DATA.VAL.CROSS_VAL,
             cross_val_nsplits=self.cfg.DATA.VAL.CROSS_VAL_NFOLD,
             cross_val_fold=self.cfg.DATA.VAL.CROSS_VAL_FOLD,
@@ -249,9 +281,7 @@ class Classification_Workflow(Base_Workflow):
         self.Y_train, self.Y_val = None, None
 
     def load_test_data(self):
-        """
-        Load test data.
-        """
+        """Load test data."""
         if self.cfg.TEST.ENABLE:
             print("######################")
             print("#   LOAD TEST DATA   #")
@@ -273,8 +303,9 @@ class Classification_Workflow(Base_Workflow):
                 self.test_filenames,
             ) = load_and_prepare_cls_test_data(
                 test_path=self.cfg.DATA.TEST.PATH,
+                norm_module=self.norm_module,
                 use_val_as_test=self.cfg.DATA.TEST.USE_VAL_AS_TEST,
-                expected_classes=self.cfg.MODEL.N_CLASSES if self.use_gt else 1,
+                expected_classes=self.cfg.DATA.N_CLASSES if self.use_gt else 1,
                 crop_shape=self.cfg.DATA.PATCH_SIZE,
                 is_3d=(self.cfg.PROBLEM.NDIM == "3D"),
                 reflect_to_complete_shape=self.cfg.DATA.REFLECT_TO_COMPLETE_SHAPE,
@@ -283,9 +314,7 @@ class Classification_Workflow(Base_Workflow):
             )
 
     def process_test_sample(self):
-        """
-        Function to process a sample in the inference phase.
-        """
+        """Process a sample in the inference phase."""
         assert isinstance(self.all_pred, list) and isinstance(self.all_gt, list)
         # Skip processing image
         if "discard" in self.current_sample["X"] and self.current_sample["X"]["discard"]:
@@ -299,7 +328,10 @@ class Classification_Workflow(Base_Workflow):
                 if (k + 1) * self.cfg.TRAIN.BATCH_SIZE < self.current_sample["X"].shape[0]
                 else self.current_sample["X"].shape[0]
             )
-            p = self.model_call_func(self.current_sample["X"][k * self.cfg.TRAIN.BATCH_SIZE : top]).cpu().numpy()
+            p = self.model_call_func(self.current_sample["X"][k * self.cfg.TRAIN.BATCH_SIZE : top])
+            if isinstance(p, dict):
+                p = p["pred"]
+            p = p.cpu().numpy()
             p = np.argmax(p, axis=1)
             self.all_pred.append(p)
 
@@ -336,15 +368,15 @@ class Classification_Workflow(Base_Workflow):
         return self.model(in_img)
 
     def after_all_images(self):
-        """
-        Steps that must be done after predicting all images.
-        """
+        """Execute steps that are needed after predicting all images."""
         self.all_pred = np.array(self.all_pred).squeeze()
         if self.cfg.DATA.TEST.LOAD_GT and self.all_gt is not None:
             self.all_gt = np.array(self.all_gt).squeeze()
 
         # Save predictions in a csv file
-        df = pd.DataFrame(self.test_filenames, columns=["filename"])
+        assert self.test_filenames is not None, "Test filenames must be defined before saving predictions."
+        t_filename = [x.path for x in self.test_filenames]
+        df = pd.DataFrame(t_filename, columns=["filename"])
         df["class"] = self.all_pred
         f = os.path.join(self.cfg.PATHS.RESULT_DIR.PATH, "predictions.csv")
         os.makedirs(self.cfg.PATHS.RESULT_DIR.PATH, exist_ok=True)
@@ -379,10 +411,10 @@ class Classification_Workflow(Base_Workflow):
                         if self.class_names:
                             display_labels = [
                                 "Category {} ({})".format(i, self.class_names[i])
-                                for i in range(self.cfg.MODEL.N_CLASSES)
+                                for i in range(self.cfg.DATA.N_CLASSES)
                             ]
                         else:
-                            display_labels = ["Category {}".format(i) for i in range(self.cfg.MODEL.N_CLASSES)]
+                            display_labels = ["Category {}".format(i) for i in range(self.cfg.DATA.N_CLASSES)]
                         print("\n" + classification_report(self.all_gt, self.all_pred, target_names=display_labels))  # type: ignore
                     else:
                         print(
@@ -394,7 +426,7 @@ class Classification_Workflow(Base_Workflow):
 
     def after_merge_patches(self, pred):
         """
-        Steps need to be done after merging all predicted patches into the original image.
+        Execute steps that are needed after merging all predicted patches into the original image.
 
         Parameters
         ----------
@@ -405,7 +437,7 @@ class Classification_Workflow(Base_Workflow):
 
     def after_full_image(self, pred: NDArray):
         """
-        Steps that must be executed after generating the prediction by supplying the entire image to the model.
+        Execute steps that are needed after generating the prediction by supplying the entire image to the model.
 
         Parameters
         ----------

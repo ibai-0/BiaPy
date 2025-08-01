@@ -1,3 +1,44 @@
+"""
+Data Manipulation Module for BiaPy.
+
+This module provides a collection of functions for loading, processing, and manipulating 
+biological image data for deep learning applications. It supports both 2D and 3D data 
+formats, including common file types like TIFF, HDF5, Zarr, and NumPy arrays.
+
+Key Functionalities:
+- Loading training, validation, and test data from various formats
+- Data preprocessing and normalization
+- Image cropping and patching with overlap
+- Data filtering based on various properties
+- Cross-validation and train-test splitting
+- Data augmentation and shape manipulation
+- Format conversion (e.g., to one-hot encoding)
+- Data saving in multiple formats
+
+The module supports:
+- Both 2D and 3D image data
+- Multiple input formats (TIFF, HDF5, Zarr, NumPy arrays)
+- Classification and segmentation workflows
+- Memory-efficient loading of large datasets
+- Parallel processing capabilities
+- Data validation and consistency checks
+
+Main Classes and Functions:
+- load_and_prepare_train_data(): Main function for loading training data
+- load_and_prepare_test_data(): Function for loading test data
+- load_and_prepare_cls_test_data(): For classification test data
+- samples_from_image_list(): Creates dataset from image list
+- samples_from_zarr(): Handles Zarr/HDF5 datasets
+- filter_samples_by_properties(): Filters data based on conditions
+- img_to_onehot_encoding(): Converts masks to one-hot format
+- save_tif(), save_npy_files(): Data saving utilities
+
+Typical Workflow:
+1. Load data using one of the load_and_prepare_* functions
+2. Apply preprocessing/normalization
+3. Filter or augment data as needed
+4. Use in training or save processed data
+"""
 import os
 import h5py
 import torch
@@ -16,6 +57,8 @@ from numpy.typing import NDArray
 from yacs.config import CfgNode as CN
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split, StratifiedKFold
+import torch.nn.functional as F
+from skimage.transform import resize as sk_resize
 
 from biapy.data.dataset import BiaPyDataset, DatasetFile, DataSample, PatchCoords
 from biapy.data.norm import Normalization
@@ -944,7 +987,6 @@ def load_and_prepare_test_data(
     test_filenames : list of str
         List of test filenames.
     """
-
     print("### LOAD ###")
 
     sample_list = []
@@ -1033,6 +1075,7 @@ def load_and_prepare_test_data(
 
 def load_and_prepare_cls_test_data(
     test_path: str,
+    norm_module: Normalization,
     use_val_as_test: bool,
     expected_classes: int,
     crop_shape: Tuple[int, ...],
@@ -1048,6 +1091,9 @@ def load_and_prepare_cls_test_data(
     ----------
     train_path : str
         Path to the training data.
+
+    norm_module : Normalization
+        Information about the normalization.
 
     use_val_as_test : bool
         Whether to use validation data as test.
@@ -1091,7 +1137,6 @@ def load_and_prepare_cls_test_data(
     test_filenames : list of str
         List of test filenames.
     """
-
     print("### LOAD ###")
 
     X_test = []
@@ -1104,6 +1149,7 @@ def load_and_prepare_cls_test_data(
 
     X_test = samples_from_class_list(
         data_path=path_to_process,
+        norm_module=norm_module,
         expected_classes=expected_classes,
         crop_shape=crop_shape,
         is_3d=is_3d,
@@ -1190,6 +1236,7 @@ def load_data_from_dir(
 
 def load_cls_data_from_dir(
     data_path: str,
+    norm_module: Normalization,
     expected_classes: int,
     crop_shape: Optional[Tuple[int, ...]],
     is_3d: bool = True,
@@ -1205,6 +1252,9 @@ def load_cls_data_from_dir(
     ----------
     data_path : str
         Path to read the images from.
+
+    norm_module : Normalization
+        Information about the normalization.
 
     expected_classes : int
         Expected number of classes to be loaded.
@@ -1236,6 +1286,7 @@ def load_cls_data_from_dir(
     """
     data_samples = samples_from_class_list(
         data_path=data_path,
+        norm_module=norm_module,
         expected_classes=expected_classes,
         crop_shape=crop_shape,
         is_3d=is_3d,
@@ -1263,6 +1314,7 @@ def load_and_prepare_train_data_cls(
     val_path: str,
     val_in_memory: bool,
     expected_classes: int,
+    norm_module: Normalization,
     crop_shape: Tuple[int, ...],
     cross_val: bool = False,
     cross_val_nsplits: int = 5,
@@ -1281,7 +1333,6 @@ def load_and_prepare_train_data_cls(
     val_filter_vals: List[List[int | float]] = [],
     val_filter_signs: List[List[str]] = [],
     norm_before_filter: bool = False,
-    norm_module: Optional[Normalization] = None,
     reflect_to_complete_shape: bool = False,
     convert_to_rgb: bool = False,
     is_3d: bool = False,
@@ -1438,6 +1489,7 @@ def load_and_prepare_train_data_cls(
 
     X_train = samples_from_class_list(
         data_path=train_path,
+        norm_module=norm_module,
         expected_classes=expected_classes,
         crop_shape=crop_shape,
         is_3d=is_3d,
@@ -1497,6 +1549,7 @@ def load_and_prepare_train_data_cls(
             is_3d=is_3d,
             reflect_to_complete_shape=reflect_to_complete_shape,
             convert_to_rgb=convert_to_rgb,
+            norm_module=norm_module,
         )
 
         if len(val_filter_props) > 0:
@@ -1693,8 +1746,10 @@ def samples_from_image_list(
             path=os.path.join(data_path, list_of_data[i]),
             shape=original_data_shape,
         )
+        # Depending on the normalization choosen we need to set the stats into the DatasetFile
         norm_module.set_stats_from_image(img)
         norm_module.set_DatasetFile_from_stats(dataset_file)
+
         dataset_info.append(dataset_file)
         for j in range(tot_samples_to_insert):
             data_sample = DataSample(
@@ -2031,8 +2086,10 @@ def samples_from_image_list_multiple_raw_one_gt(
             gt_tot_samples_to_insert = 1
 
         data_file = DatasetFile(path=os.path.join(gt_path, id_, gt_id), shape=original_data_shape)
+        # Depending on the normalization choosen we need to set the stats into the DatasetFile
         norm_module.set_stats_from_image(gt_sample)
         norm_module.set_DatasetFile_from_stats(data_file)
+
         gt_dataset_info.append(data_file)
         for i in range(gt_tot_samples_to_insert):
             coords = None
@@ -2111,8 +2168,10 @@ def samples_from_image_list_multiple_raw_one_gt(
                 path=os.path.join(associated_raw_image_dir, raw_sample_id),
                 shape=original_data_shape,
             )
+            # Depending on the normalization choosen we need to set the stats into the DatasetFile
             norm_module.set_stats_from_image(raw_sample)
             norm_module.set_DatasetFile_from_stats(dataset_file)
+
             dataset_info.append(dataset_file)
             for i in range(tot_samples_to_insert):
                 data_sample = DataSample(
@@ -2132,6 +2191,7 @@ def samples_from_image_list_multiple_raw_one_gt(
 
 def samples_from_class_list(
     data_path: str,
+    norm_module: Normalization,
     crop_shape: Optional[Tuple[int, ...]] = None,
     expected_classes: int = -1,
     is_3d: bool = True,
@@ -2140,12 +2200,16 @@ def samples_from_class_list(
 ) -> BiaPyDataset:
     """
     Create dataset samples from the given path taking into account that each subfolder represents a class.
+
     This function does not load the data.
 
     Parameters
     ----------
     data_path : str
         Directory of the images to read.
+
+    norm_module : Normalization
+        Information about the normalization.
 
     crop_shape : 3D/4D int tuple, optional
         Shape of the crops. E.g. ``(y, x, channels)`` for 2D and ``(z, y, x, channels)`` for 3D.
@@ -2177,7 +2241,7 @@ def samples_from_class_list(
         if expected_classes:
             if expected_classes != len(list_of_classes):
                 raise ValueError(
-                    "Found {} number of classes (folders: {}) but 'MODEL.N_CLASSES' was set to {}. They must match. Aborting...".format(
+                    "Found {} number of classes (folders: {}) but 'DATA.N_CLASSES' was set to {}. They must match. Aborting...".format(
                         len(list_of_classes), list_of_classes, expected_classes
                     )
                 )
@@ -2241,14 +2305,18 @@ def samples_from_class_list(
                     f"of {data_range_expected}) in the folder. Current image: {img_path}"
                 )
 
-            xdataset_info.append(
-                DatasetFile(
+            dataset_file =DatasetFile(
                     path=img_path,
                     shape=img.shape,
                     class_name=class_name,
                     class_num=c_num if gt_loaded else -1,
                 )
-            )
+
+            # Depending on the normalization choosen we need to set the stats into the DatasetFile
+            norm_module.set_stats_from_image(img)
+            norm_module.set_DatasetFile_from_stats(dataset_file)
+
+            xdataset_info.append(dataset_file)
             sample_dict = DataSample(
                 fid=data_file_count,
                 coords=None,
@@ -2278,9 +2346,9 @@ def filter_samples_by_properties(
     save_filtered_images_num: int = 3,
 ):
     """
-    Filter samples from ``x_dataset`` using defined conditions. The filtering will be done using the images each sample is extracted
-    from. However, if ``zarr_data_info`` is provided the function will assume that Zarr/h5 files are provided, so the filtering will be
-    performed sample by sample.
+    Filter samples from ``x_dataset`` using defined conditions.
+    
+    The filtering will be done using the images each sample is extracted from. However, if ``zarr_data_info`` is provided the function will assume that Zarr/h5 files are provided, so the filtering will be performed sample by sample.
 
     Parameters
     ----------
@@ -2797,8 +2865,10 @@ def load_images_to_dataset(
     zarr_data_information: Optional[Dict] = None,
 ):
     """
-    Load images into the ``dataset``: creating ``"img"`` key. The process done faster
-    if the samples extracted from the same image are in continuous positions within the list.
+    Load images into the ``dataset``: creating ``"img"`` key.
+    
+    The process done faster if the samples extracted from the same
+    image are in continuous positions within the list.
 
     Parameters
     ----------
@@ -3075,7 +3145,7 @@ def extract_patch_within_image(img: NDArray, coords: PatchCoords, is_3d=False) -
 
 def img_to_onehot_encoding(img: NDArray, num_classes: int = 2) -> NDArray:
     """
-    Converts image given into one-hot encode format.
+    Convert image given into one-hot encode format.
 
     The opposite function is :func:`~onehot_encoding_to_img`.
 
@@ -3110,7 +3180,7 @@ def img_to_onehot_encoding(img: NDArray, num_classes: int = 2) -> NDArray:
 
 def onehot_encoding_to_img(encoded_image: NDArray) -> NDArray:
     """
-    Converts one-hot encode image into an image with jus tone channel and all the classes represented by an integer.
+    Convert one-hot encode image into an image with jus tone channel and all the classes represented by an integer.
 
     The opposite function is :func:`~img_to_onehot_encoding`.
 
@@ -3196,6 +3266,7 @@ def read_img_as_ndarray(path: str, is_3d: bool = False) -> NDArray:
         Image read. E.g. ``(z, y, x, channels)`` for 3D or ``(y, x, channels)`` for 2D.
     """
     # Read image
+    axes_position = None
     if path.endswith(".npy"):
         img = np.load(path)
     elif path.endswith(".pt"):
@@ -3209,21 +3280,22 @@ def read_img_as_ndarray(path: str, is_3d: bool = False) -> NDArray:
         _, img = read_chunked_data(path)
         img = np.array(img)
     else:
-        img = imread(path)
+        img, axes_position = imread(path)
     img = np.squeeze(img)
 
     if not is_3d:
         img = ensure_2d_shape(img, path)
     else:
-        img = ensure_3d_shape(img, path)
+        img = ensure_3d_shape(img, path, data_axes_order=axes_position)
 
     return img
 
 
-def imread(path: str) -> NDArray:
+def imread(path: str) -> NDArray | Tuple[NDArray, Optional[str]]:
     """
-    Read an image from a given path. In the past from ``skimage.io import imread``
-    was used but now it is deprecated.
+    Read an image from a given path.
+
+    In the past from ``skimage.io import imread`` was used but now it is deprecated.
 
     Parameters
     ----------
@@ -3236,15 +3308,20 @@ def imread(path: str) -> NDArray:
         Image read.
     """
     if path.lower().endswith((".tiff", ".tif")):
-        return tifffile.imread(path)
+        try:
+            with tifffile.TiffFile(path) as tif:
+                return tif.series[0].asarray(), tif.series[0].axes
+        except:
+            return tifffile.imread(path), None
     else:
-        return imageio.imread(path)
+        return imageio.imread(path), None
 
 
 def imwrite(path: str, image: NDArray):
     """
-    Writes ``data`` in the given ``path``. In the past from ``skimage.io import imsave``
-    was used but now it is deprecated.
+    Write ``data`` in the given ``path``.
+    
+    In the past from ``skimage.io import imsave`` was used but now it is deprecated.
 
     Parameters
     ----------
@@ -3277,7 +3354,25 @@ def check_value(
     value_range: Tuple[int | float, int | float] = (0, 1),
 ) -> bool:
     """
-    Checks if a value is within a range
+    Check whether a value or a collection of values falls within a specified range.
+
+    This function supports individual values (int, float), lists or tuples of values,
+    and NumPy arrays. If `value` is a list or tuple, all elements must fall within
+    the specified `value_range`. For NumPy arrays, both the minimum and maximum
+    values of the array must be within the range.
+
+    Parameters
+    ----------
+    value : int, float, list, tuple or np.ndarray
+        The value or collection of values to check.
+    value_range : tuple of (int or float), optional
+        A (min, max) tuple specifying the inclusive range of valid values.
+        Default is (0, 1).
+
+    Returns
+    -------
+    bool
+        True if all values are within the specified range; False otherwise.
     """
     if isinstance(value, list) or isinstance(value, tuple):
         for i in range(len(value)):
@@ -3299,6 +3394,33 @@ def check_value(
 
 
 def data_range(x: NDArray) -> str:
+    """
+    Determine the value range of a NumPy array commonly used in image data.
+
+    This function checks whether the input array falls within one of the standard
+    intensity ranges used in image processing: [0, 1], [0, 255], or [0, 65535],
+    corresponding to normalized float, 8-bit, or 16-bit unsigned integer images,
+    respectively.
+
+    Parameters
+    ----------
+    x : np.ndarray
+        The input array whose range is to be determined.
+
+    Returns
+    -------
+    str
+        A string indicating the value range:
+        - "01 range" for values in [0, 1]
+        - "uint8 range" for values in [0, 255]
+        - "uint16 range" for values in [0, 65535]
+        - "none_range" if values fall outside these common ranges
+
+    Raises
+    ------
+    ValueError
+        If the input is not a NumPy array.
+    """
     if not isinstance(x, np.ndarray):
         raise ValueError("Input array of type {} and not numpy array".format(type(x)))
     if check_value(x, (0, 1)):
@@ -3313,8 +3435,9 @@ def data_range(x: NDArray) -> str:
 
 def check_masks(path: str, n_classes: int = 2, is_3d: bool = False):
     """
-    Check whether the data masks have the correct labels inspection a few random images of the given path. If the
-    function gives no error one should assume that the masks are correct.
+    Check whether the data masks have the correct labels inspection a few random images of the given path.
+    
+    If the function gives no error one should assume that the masks are correct.
 
     Parameters
     ----------
@@ -3343,7 +3466,7 @@ def check_masks(path: str, n_classes: int = 2, is_3d: bool = False):
             values = np.unique(img)
             if len(values) > n_classes:
                 print(
-                    "Error: given mask ({}) has more classes than specified in 'MODEL.N_CLASSES'. "
+                    "Error: given mask ({}) has more classes than specified in 'DATA.N_CLASSES'. "
                     "Values found: {}".format(os.path.join(path, ids[i]), values)
                 )
                 error = True
@@ -3353,22 +3476,22 @@ def check_masks(path: str, n_classes: int = 2, is_3d: bool = False):
 
     if len(classes_found) > n_classes:
         m += (
-            "Number of classes found across images is greater than the value specified in 'MODEL.N_CLASSES'. "
+            "Number of classes found across images is greater than the value specified in 'DATA.N_CLASSES'. "
             f"Classes found: {classes_found}\n"
         )
         error = True
 
     if error:
         m += (
-            "'MODEL.N_CLASSES' variable value must be set taking into account the background class. E.g. if mask has [0,1,2] "
-            "values 'MODEL.N_CLASSES' should be 3.\nCorrect the errors in the masks above to continue"
+            "'DATA.N_CLASSES' variable value must be set taking into account the background class. E.g. if mask has [0,1,2] "
+            "values 'DATA.N_CLASSES' should be 3.\nCorrect the errors in the masks above to continue"
         )
         raise ValueError(m)
 
 
 def shape_mismatch_message(X_data: BiaPyDataset, Y_data: BiaPyDataset) -> str:
     """
-    Builds an error message with the shape mismatch between two provided data ``X_data`` and ``Y_data``.
+    Build an error message with the shape mismatch between two provided data ``X_data`` and ``Y_data``.
 
     Parameters
     ----------
@@ -3406,9 +3529,12 @@ def shape_mismatch_message(X_data: BiaPyDataset, Y_data: BiaPyDataset) -> str:
 
 def save_tif(X: NDArray, data_dir: str, filenames: Optional[List[str]] = None, verbose: bool = True):
     """
-    Save images in the given directory. If the input file has a different dtype than np.uint8, np.uint16,
-    np.float32 it is casted into np.float32 automatically. This is done because if not the axes are not
-    correctly set when opening resulting images in Fiji/ImageJ.
+    Save images in the given directory.
+
+    If the input file has a different dtype than np.uint8, np.uint16,
+    np.float32 it is casted into np.float32 automatically. This is done
+    because if not the axes are not correctly set when opening resulting
+    images in Fiji/ImageJ.
 
     Parameters
     ----------
@@ -3425,7 +3551,6 @@ def save_tif(X: NDArray, data_dir: str, filenames: Optional[List[str]] = None, v
     verbose : bool, optional
          To print saving information.
     """
-
     if verbose:
         s = X.shape if not isinstance(X, list) else X[0].shape
         print("Saving {} data as .tif in folder: {}".format(s, data_dir))
@@ -3500,7 +3625,6 @@ def save_tif_pair_discard(
     verbose : bool, optional
          To print saving information.
     """
-
     if verbose:
         s = X.shape if not isinstance(X, list) else X[0].shape
         print("Saving {} data as .tif in folder: {}".format(s, data_dir))
@@ -3554,7 +3678,6 @@ def save_npy_files(X: NDArray, data_dir: str, filenames: Optional[List[str]] = N
     verbose : bool, optional
          To print saving information.
     """
-
     if verbose:
         s = X.shape if not isinstance(X, list) else X[0].shape
         print("Saving {} data as .npy in folder: {}".format(s, data_dir))
@@ -3588,7 +3711,9 @@ def reduce_dtype(
     eps: float = 1e-6,
 ) -> NDArray:
     """
-    Reduce the data type of the given input to the selected range using the formula:
+    Reduce the data type of the given input to the selected range.
+    
+    It uses the following formula:
     ``results = ((x - x_min)/(x_max - x_min)) * (out_max - out_min)``
 
     Parameters
@@ -3633,3 +3758,71 @@ def reduce_dtype(
         return ((((x - x_min) / (x_max - x_min + eps)) * (out_max - out_min)) + out_min).to(
             torch_numpy_dtype_dict[out_type][0]
         )
+
+# Map common interpolation modes to:
+#   - PyTorch 'mode' string
+#   - scikit-image 'order' int
+interp_mode_map = {
+    'nearest':     {'torch': 'nearest',      'skimage': 0},
+    'linear':      {'torch': 'linear',       'skimage': 1},  # 3D only in PyTorch
+    'bilinear':    {'torch': 'bilinear',     'skimage': 1},
+    'bicubic':     {'torch': 'bicubic',      'skimage': 3},
+    'trilinear':   {'torch': 'trilinear',    'skimage': 1},  # fallback for 3D
+    'area':        {'torch': 'area',         'skimage': 1},  # approximate
+    'nearest-exact': {'torch': 'nearest-exact', 'skimage': 0}
+}
+
+def resize(input_data, size, mode='bilinear', **kwargs):
+    """
+    Resize a multi-dimensional image tensor or array to a specified size.
+
+    This function resizes 2D or 3D image data in either PyTorch tensor or NumPy array
+    format using appropriate interpolation methods. The input is expected to follow
+    common conventions for image dimensions.
+
+    Supported input formats:
+    - PyTorch tensor of shape (B, C, H, W) for 2D or (B, C, D, H, W) for 3D data
+    - NumPy array of shape (B, H, W, C) for 2D or (B, D, H, W, C) for 3D data
+
+    Parameters
+    ----------
+    input_data : torch.Tensor or np.ndarray
+        The image data to be resized.
+    size : tuple of int
+        Target size for each dimension. Must match the number of dimensions in input_data.
+        Only spatial dimensions are resized (e.g., H, W, D), batch and channel dimensions are preserved.
+    mode : str, optional
+        Interpolation mode to use. Must be one of the keys in `interp_mode_map`. Defaults to 'bilinear'.
+    **kwargs : dict
+        Additional arguments passed to `torch.nn.functional.interpolate` or `skimage.transform.resize`.
+
+    Returns
+    -------
+    torch.Tensor or np.ndarray
+        The resized image data in the same format as the input.
+
+    Raises
+    ------
+    ValueError
+        If the length of `size` does not match the number of dimensions in `input_data`,
+        or if an unsupported interpolation mode is specified.
+    TypeError
+        If `input_data` is neither a PyTorch tensor nor a NumPy array.
+    """
+    if len(size) != input_data.ndim:
+        raise ValueError("The size provided ({}) needs to be of the same size as the dimensions of the input_data ({})".format(size, input_data.ndim))
+    
+    if mode not in interp_mode_map:
+        raise ValueError(f"Unsupported interpolation mode: {mode}")
+
+    # Assumed B,C,H,W (2D) or B,C,D,H,W (3D)
+    if isinstance(input_data, torch.Tensor):
+        interp_mode = interp_mode_map[mode]['torch']
+        resized = F.interpolate(input_data, size=size[2:], mode=interp_mode, **kwargs)
+        return resized
+    # Assumed B,H,W,C (2D) or B,D,H,W,C (3D)
+    elif isinstance(input_data, np.ndarray):
+        order = interp_mode_map[mode]['skimage']
+        return sk_resize(input_data, size, order=order, **kwargs)
+    else:
+        raise TypeError("Input must be a torch.Tensor or a numpy.ndarray")

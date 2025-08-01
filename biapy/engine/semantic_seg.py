@@ -1,3 +1,11 @@
+"""
+Semantic segmentation workflow for BiaPy.
+
+This module defines the Semantic_Segmentation_Workflow class, which implements the
+training, validation, and inference pipeline for semantic segmentation tasks in BiaPy.
+It handles data preparation, model setup, metrics, predictions, post-processing,
+and result saving for assigning a class to each pixel in 2D and 3D images.
+"""
 import torch
 import numpy as np
 from skimage.transform import resize
@@ -14,13 +22,14 @@ from biapy.engine.metrics import (
     CrossEntropyLoss_wrapper,
     DiceBCELoss,
     DiceLoss,
+    ContrastCELoss,
 )
-from biapy.data.dataset import PatchCoords
 
 
 class Semantic_Segmentation_Workflow(Base_Workflow):
     """
     Semantic segmentation workflow where the goal is to assign a class to each pixel of the input image.
+
     More details in `our documentation <https://biapy.readthedocs.io/en/latest/workflows/semantic_segmentation.html>`_.
 
     Parameters
@@ -39,14 +48,33 @@ class Semantic_Segmentation_Workflow(Base_Workflow):
     """
 
     def __init__(self, cfg, job_identifier, device, args, **kwargs):
+        """
+        Initialize the Semantic_Segmentation_Workflow.
+
+        Sets up configuration, device, job identifier, and initializes
+        workflow-specific attributes for semantic segmentation tasks.
+
+        Parameters
+        ----------
+        cfg : YACS configuration
+            Running configuration.
+        job_identifier : str
+            Complete name of the running job.
+        device : torch.device
+            Device used.
+        args : argparse.Namespace
+            Arguments used in BiaPy's call.
+        **kwargs : dict
+            Additional keyword arguments.
+        """
         super(Semantic_Segmentation_Workflow, self).__init__(cfg, job_identifier, device, args, **kwargs)
 
         if cfg.TRAIN.ENABLE and cfg.DATA.TRAIN.CHECK_DATA:
-            check_masks(cfg.DATA.TRAIN.GT_PATH, n_classes=cfg.MODEL.N_CLASSES, is_3d=(self.cfg.PROBLEM.NDIM == "3D"))
+            check_masks(cfg.DATA.TRAIN.GT_PATH, n_classes=cfg.DATA.N_CLASSES, is_3d=(self.cfg.PROBLEM.NDIM == "3D"))
             if not cfg.DATA.VAL.FROM_TRAIN:
-                check_masks(cfg.DATA.VAL.GT_PATH, n_classes=cfg.MODEL.N_CLASSES, is_3d=(self.cfg.PROBLEM.NDIM == "3D"))
+                check_masks(cfg.DATA.VAL.GT_PATH, n_classes=cfg.DATA.N_CLASSES, is_3d=(self.cfg.PROBLEM.NDIM == "3D"))
         if cfg.TEST.ENABLE and cfg.DATA.TEST.LOAD_GT and cfg.DATA.TEST.CHECK_DATA:
-            check_masks(cfg.DATA.TEST.GT_PATH, n_classes=cfg.MODEL.N_CLASSES, is_3d=(self.cfg.PROBLEM.NDIM == "3D"))
+            check_masks(cfg.DATA.TEST.GT_PATH, n_classes=cfg.DATA.N_CLASSES, is_3d=(self.cfg.PROBLEM.NDIM == "3D"))
 
         # From now on, no modification of the cfg will be allowed
         self.cfg.freeze()
@@ -60,6 +88,8 @@ class Semantic_Segmentation_Workflow(Base_Workflow):
 
     def define_activations_and_channels(self):
         """
+        Define the model output channels and activations to be applied to them.
+
         This function must define the following variables:
 
         self.model_output_channels : List of functions
@@ -76,8 +106,9 @@ class Semantic_Segmentation_Workflow(Base_Workflow):
         """
         self.model_output_channels = {
             "type": "mask",
-            "channels": [1 if self.cfg.MODEL.N_CLASSES <= 2 else self.cfg.MODEL.N_CLASSES],
+            "channels": [1 if self.cfg.DATA.N_CLASSES <= 2 else self.cfg.DATA.N_CLASSES],
         }
+        self.real_classes = self.cfg.DATA.N_CLASSES
         self.multihead = False
         self.activations = [{":": "CE_Sigmoid"}]
 
@@ -85,6 +116,8 @@ class Semantic_Segmentation_Workflow(Base_Workflow):
 
     def define_metrics(self):
         """
+        Define the metrics to be calculated during training and test/inference.
+
         This function must define the following variables:
 
         self.train_metrics : List of functions
@@ -112,9 +145,11 @@ class Semantic_Segmentation_Workflow(Base_Workflow):
             if metric in ["iou", "jaccard_index"]:
                 self.train_metrics.append(
                     jaccard_index(
-                        num_classes=self.cfg.MODEL.N_CLASSES,
+                        num_classes=self.cfg.DATA.N_CLASSES,
                         device=self.device,
                         model_source=self.cfg.MODEL.SOURCE,
+                        ndim=self.dims,
+                        ignore_index=self.cfg.LOSS.IGNORE_INDEX,
                     )
                 )
                 self.train_metric_names.append("IoU")
@@ -126,30 +161,41 @@ class Semantic_Segmentation_Workflow(Base_Workflow):
             if metric in ["iou", "jaccard_index"]:
                 self.test_metrics.append(
                     jaccard_index(
-                        num_classes=self.cfg.MODEL.N_CLASSES,
+                        num_classes=self.cfg.DATA.N_CLASSES,
                         device=self.device,
                         model_source=self.cfg.MODEL.SOURCE,
+                        ndim=self.dims,
+                        ignore_index=self.cfg.LOSS.IGNORE_INDEX,
                     )
                 )
                 self.test_metric_names.append("IoU")
 
         if self.cfg.LOSS.TYPE == "CE":
-            self.loss = CrossEntropyLoss_wrapper(
-                num_classes=self.cfg.MODEL.N_CLASSES,
+            semantic_loss = CrossEntropyLoss_wrapper(
+                num_classes=self.cfg.DATA.N_CLASSES,
+                ndim=self.dims,
                 model_source=self.cfg.MODEL.SOURCE,
                 class_rebalance=self.cfg.LOSS.CLASS_REBALANCE,
+                ignore_index = self.cfg.LOSS.IGNORE_INDEX
             )
         elif self.cfg.LOSS.TYPE == "DICE":
-            self.loss = DiceLoss()
+            semantic_loss = DiceLoss()
         elif self.cfg.LOSS.TYPE == "W_CE_DICE":
-            self.loss = DiceBCELoss(w_dice=self.cfg.LOSS.WEIGHTS[0], w_bce=self.cfg.LOSS.WEIGHTS[1])
+            semantic_loss = DiceBCELoss(w_dice=self.cfg.LOSS.WEIGHTS[0], w_bce=self.cfg.LOSS.WEIGHTS[1])
+
+        if self.cfg.LOSS.CONTRAST.ENABLE: 
+            self.loss = ContrastCELoss(
+                main_loss=semantic_loss, # type: ignore
+                ndim=self.dims,
+                ignore_index=self.cfg.LOSS.IGNORE_INDEX,
+            )
+        else:
+            self.loss = semantic_loss
 
         super().define_metrics()
 
     def process_test_sample(self):
-        """
-        Function to process a sample in the inference phase.
-        """
+        """Process a sample in the inference phase."""
         if self.cfg.MODEL.SOURCE != "torchvision":
             super().process_test_sample()
         else:
@@ -182,8 +228,9 @@ class Semantic_Segmentation_Workflow(Base_Workflow):
                 pred = apply_binary_mask(pred, self.cfg.DATA.TEST.BINARY_MASKS)
 
             if self.current_sample["Y"] is not None:
-                if pred.shape != self.current_sample["Y"].shape:
-                    self.current_sample["Y"] = resize(self.current_sample["Y"], pred.shape, order=0)
+                if pred.shape[1:-1] != self.current_sample["Y"].shape[1:-1]:
+                    sshape = (pred.shape[0],) + self.current_sample["Y"].shape[1:-1] + (pred.shape[-1],)
+                    pred = resize(pred, sshape, order=1)
 
                 metric_values = self.metric_calculation(output=pred, targets=self.current_sample["Y"], train=False)
                 for metric in metric_values:
@@ -243,7 +290,7 @@ class Semantic_Segmentation_Workflow(Base_Workflow):
         metric_logger: Optional[MetricLogger] = None,
     ) -> Dict:
         """
-        Execution of the metrics defined in :func:`~define_metrics` function.
+        Calculate the metrics defined in :func:`~define_metrics` function.
 
         Parameters
         ----------
@@ -306,8 +353,10 @@ class Semantic_Segmentation_Workflow(Base_Workflow):
 
     def prepare_targets(self, targets, batch):
         """
-        Location to perform any necessary data transformations to ``targets``
-        before calculating the loss.
+        Prepare the targets for the loss calculation.
+        
+        This function is used to convert the targets to the correct format
+        and device, ensuring they match the model's expected input format.
 
         Parameters
         ----------
@@ -327,7 +376,7 @@ class Semantic_Segmentation_Workflow(Base_Workflow):
 
     def after_merge_patches(self, pred):
         """
-        Steps need to be done after merging all predicted patches into the original image.
+        Execute steps needed after merging all predicted patches into the original image.
 
         Parameters
         ----------
@@ -335,7 +384,7 @@ class Semantic_Segmentation_Workflow(Base_Workflow):
             Model prediction.
         """
         # Save simple binarization of predictions
-        if self.cfg.MODEL.N_CLASSES <= 2:
+        if self.cfg.DATA.N_CLASSES <= 2:
             pred = (pred > 0.5).astype(np.uint8)
         save_tif(
             pred,
@@ -346,7 +395,7 @@ class Semantic_Segmentation_Workflow(Base_Workflow):
 
     def after_full_image(self, pred: NDArray):
         """
-        Steps that must be executed after generating the prediction by supplying the entire image to the model.
+        Execute steps needed after generating the prediction by supplying the entire image to the model.
 
         Parameters
         ----------
@@ -362,7 +411,5 @@ class Semantic_Segmentation_Workflow(Base_Workflow):
         )
 
     def after_all_images(self):
-        """
-        Steps that must be done after predicting all images.
-        """
+        """Execute steps needed after predicting all images."""
         super().after_all_images()

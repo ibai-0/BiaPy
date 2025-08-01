@@ -1,3 +1,11 @@
+"""
+Detection workflow for BiaPy.
+
+This module defines the Detection_Workflow class, which implements the
+training, validation, and inference pipeline for object detection tasks in BiaPy.
+It handles data preparation, model setup, metrics, predictions, post-processing,
+and result saving for localization of objects in 2D and 3D images.
+"""
 import os
 import torch
 import torch.distributed as dist
@@ -38,6 +46,7 @@ from biapy.data.dataset import PatchCoords
 class Detection_Workflow(Base_Workflow):
     """
     Detection workflow where the goal is to localize objects in the input image, not requiring a pixel-level class.
+
     More details in `our documentation <https://biapy.readthedocs.io/en/latest/workflows/detection.html>`_.
 
     Parameters
@@ -56,6 +65,25 @@ class Detection_Workflow(Base_Workflow):
     """
 
     def __init__(self, cfg, job_identifier, device, args, **kwargs):
+        """
+        Initialize the Detection_Workflow.
+
+        Sets up configuration, device, job identifier, and initializes
+        workflow-specific attributes for detection tasks.
+
+        Parameters
+        ----------
+        cfg : YACS configuration
+            Running configuration.
+        job_identifier : str
+            Complete name of the running job.
+        device : torch.device
+            Device used.
+        args : argparse.Namespace
+            Arguments used in BiaPy's call.
+        **kwargs : dict
+            Additional keyword arguments.
+        """
         super(Detection_Workflow, self).__init__(cfg, job_identifier, device, args, **kwargs)
 
         self.original_test_mask_path = self.prepare_detection_data()
@@ -79,6 +107,8 @@ class Detection_Workflow(Base_Workflow):
 
     def define_activations_and_channels(self):
         """
+        Define the activations and output channels of the model.
+
         This function must define the following variables:
 
         self.model_output_channels : List of functions
@@ -99,19 +129,22 @@ class Detection_Workflow(Base_Workflow):
         }
 
         # Multi-head: points + classification
-        if self.cfg.MODEL.N_CLASSES > 2:
+        if self.cfg.DATA.N_CLASSES > 2:
             self.activations = [{"0": "CE_Sigmoid"}, {"0": "Linear"}]
-            self.model_output_channels["channels"] = [self.model_output_channels["channels"], self.cfg.MODEL.N_CLASSES]
+            self.model_output_channels["channels"] = [self.model_output_channels["channels"], self.cfg.DATA.N_CLASSES]
             self.multihead = True
         else:
             self.activations = [{"0": "CE_Sigmoid"}]
             self.model_output_channels["channels"] = [self.model_output_channels["channels"]]
             self.multihead = False
+        self.real_classes = self.model_output_channels["channels"][0] + 1
 
         super().define_activations_and_channels()
 
     def define_metrics(self):
         """
+        Define the metrics to be calculated during training and test/inference phases.
+
         This function must define the following variables:
 
         self.train_metrics : List of functions
@@ -147,10 +180,12 @@ class Detection_Workflow(Base_Workflow):
 
         self.train_metrics.append(
             multiple_metrics(
-                num_classes=self.cfg.MODEL.N_CLASSES,
+                num_classes=self.cfg.DATA.N_CLASSES,
                 metric_names=self.train_metric_names,
                 device=self.device,
                 model_source=self.cfg.MODEL.SOURCE,
+                ndim=self.dims,
+                ignore_index=self.cfg.LOSS.IGNORE_INDEX,
             )
         )
 
@@ -166,10 +201,12 @@ class Detection_Workflow(Base_Workflow):
 
         self.test_metrics.append(
             multiple_metrics(
-                num_classes=self.cfg.MODEL.N_CLASSES,
+                num_classes=self.cfg.DATA.N_CLASSES,
                 metric_names=self.test_metric_names,
                 device=self.device,
                 model_source=self.cfg.MODEL.SOURCE,
+                ndim=self.dims,
+                ignore_index=self.cfg.LOSS.IGNORE_INDEX,
             )
         )
 
@@ -182,10 +219,12 @@ class Detection_Workflow(Base_Workflow):
 
         if self.cfg.LOSS.TYPE == "CE":
             self.loss = CrossEntropyLoss_wrapper(
-                num_classes=self.cfg.MODEL.N_CLASSES,
+                num_classes=self.cfg.DATA.N_CLASSES,
+                ndim=self.dims,
                 multihead=self.multihead,
                 model_source=self.cfg.MODEL.SOURCE,
                 class_rebalance=self.cfg.LOSS.CLASS_REBALANCE,
+                ignore_index = self.cfg.LOSS.IGNORE_INDEX
             )
         elif self.cfg.LOSS.TYPE == "DICE":
             self.loss = DiceLoss()
@@ -202,7 +241,7 @@ class Detection_Workflow(Base_Workflow):
         metric_logger: Optional[MetricLogger] = None,
     ) -> Dict:
         """
-        Execution of the metrics defined in :func:`~define_metrics` function.
+        Calculate the metrics defined in :func:`~define_metrics` function.
 
         Parameters
         ----------
@@ -278,8 +317,7 @@ class Detection_Workflow(Base_Workflow):
         patch_pos: Optional[PatchCoords] = None,
     ):
         """
-        Detection workflow engine for test/inference. Process model's prediction to prepare detection output and
-        calculate metrics.
+        Process model's prediction to prepare detection output and calculate metrics (detection workflow engine for test/inference).
 
         Parameters
         ----------
@@ -621,9 +659,9 @@ class Detection_Workflow(Base_Workflow):
             else:
                 gt_coordinates = [[0, y, x] for y, x in zip(zcoords, ycoords)]
 
-            if self.cfg.MODEL.N_CLASSES > 2:
+            if self.cfg.DATA.N_CLASSES > 2:
                 if "class" not in df_gt:
-                    raise ValueError("MODEL.N_CLASSES > 2 but no class specified in the CSV file")
+                    raise ValueError("DATA.N_CLASSES > 2 but no class specified in the CSV file")
             gt_points_classes = None
             if self.multihead:
                 if "class" not in df_gt:
@@ -845,7 +883,7 @@ class Detection_Workflow(Base_Workflow):
 
     def after_merge_patches(self, pred):
         """
-        Steps need to be done after merging all predicted patches into the original image.
+        Excute steps needed after merging all predicted patches into the original image.
 
         Parameters
         ----------
@@ -918,9 +956,7 @@ class Detection_Workflow(Base_Workflow):
             )
 
     def after_all_patch_prediction_by_chunks(self):
-        """
-        Place any code that needs to be done after predicting all the patches, one by one, in the "by chunks" setting.
-        """
+        """Excute stepes needed after predicting all the patches, one by one, in the "by chunks" setting."""
         assert isinstance(self.all_pred, list)
         filename, _ = os.path.splitext(self.current_sample["filename"])
         input_dir = (
@@ -928,7 +964,10 @@ class Detection_Workflow(Base_Workflow):
             if self.post_processing["detection_post"]
             else self.cfg.PATHS.RESULT_DIR.DET_LOCAL_MAX_COORDS_CHECK
         )
-        all_pred_files = sorted(next(os_walk_clean(input_dir))[2])
+        try:
+            all_pred_files = sorted(next(os_walk_clean(input_dir))[2])
+        except:
+            all_pred_files = []
         all_pred_files = [x for x in all_pred_files if filename + "_patch" in x]
         all_pred_files = [x for x in all_pred_files if "_points.csv" in x and "all_points.csv" not in x]
         if len(all_pred_files) > 0:
@@ -1079,9 +1118,7 @@ class Detection_Workflow(Base_Workflow):
             print("No points created for the given sample")
 
     def process_test_sample(self):
-        """
-        Function to process a sample in the inference phase.
-        """
+        """Process a sample in the test/inference phase."""
         if self.cfg.MODEL.SOURCE != "torchvision":
             super().process_test_sample()
         else:
@@ -1172,7 +1209,7 @@ class Detection_Workflow(Base_Workflow):
 
     def after_full_image(self, pred: NDArray):
         """
-        Steps that must be executed after generating the prediction by supplying the entire image to the model.
+        Excute steps due after generating the prediction by supplying the entire image to the model.
 
         Parameters
         ----------
@@ -1190,14 +1227,13 @@ class Detection_Workflow(Base_Workflow):
             raise NotImplementedError
 
     def after_all_images(self):
-        """
-        Steps that must be done after predicting all images.
-        """
+        """Execute steps that must be done after predicting all images."""
         super().after_all_images()
 
     def prepare_detection_data(self) -> str:
         """
-        Creates detection ground truth images to train the model based on the ground truth coordinates provided.
+        Create detection ground truth images to train the model based on the ground truth coordinates provided.
+        
         They will be saved in a separate folder in the root path of the ground truth.
         """
         original_test_mask_path = self.cfg.DATA.TEST.GT_PATH

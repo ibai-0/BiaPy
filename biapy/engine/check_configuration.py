@@ -1,4 +1,13 @@
+"""
+Configuration checking utilities for BiaPy.
+
+This module provides functions to validate, compare, and update BiaPy configuration
+objects, ensuring that all required settings are present and consistent for a given
+workflow. It includes compatibility checks for data, model, augmentation, and
+post-processing options.
+"""
 import os
+import re
 import numpy as np
 import collections
 from typing import Dict
@@ -10,7 +19,30 @@ from biapy.config import Config
 
 def check_configuration(cfg, jobname, check_data_paths=True):
     """
-    Check if the configuration is good.
+    Validate and update a BiaPy configuration object for workflow consistency.
+
+    This function checks that all required configuration options are present and consistent
+    for the selected workflow, model, and data. It performs compatibility checks for data
+    shapes, augmentation, model architecture, loss, metrics, post-processing, and file paths.
+    It also updates dependent configuration variables if needed.
+
+    Parameters
+    ----------
+    cfg : yacs.config.CfgNode
+        The configuration object to validate and update.
+    jobname : str
+        The job identifier (used for checkpoint path checks).
+    check_data_paths : bool, optional
+        Whether to check that all required data paths exist (default: True).
+
+    Raises
+    ------
+    ValueError
+        If any configuration inconsistency or missing/invalid option is found.
+    FileNotFoundError
+        If a required file or directory does not exist.
+    AssertionError
+        If a configuration assertion fails.
     """
     dim_count = 2 if cfg.PROBLEM.NDIM == "2D" else 3
 
@@ -39,7 +71,7 @@ def check_configuration(cfg, jobname, check_data_paths=True):
 
         if cfg.PROBLEM.INSTANCE_SEG.TYPE == "regular":
             channels_provided = len(cfg.PROBLEM.INSTANCE_SEG.DATA_CHANNELS.replace("Dv2", "D"))
-            if cfg.MODEL.N_CLASSES > 2:
+            if cfg.DATA.N_CLASSES > 2:
                 channels_provided += 1
         else:  # synapses
             if cfg.PROBLEM.NDIM != "3D":
@@ -234,13 +266,13 @@ def check_configuration(cfg, jobname, check_data_paths=True):
                 )
             )
         if cfg.TEST.POST_PROCESSING.DET_WATERSHED_DONUTS_CLASSES != [-1]:
-            if len(cfg.TEST.POST_PROCESSING.DET_WATERSHED_DONUTS_CLASSES) > cfg.MODEL.N_CLASSES:
+            if len(cfg.TEST.POST_PROCESSING.DET_WATERSHED_DONUTS_CLASSES) > cfg.DATA.N_CLASSES:
                 raise ValueError(
-                    "'TEST.POST_PROCESSING.DET_WATERSHED_DONUTS_CLASSES' length can't be greater than 'MODEL.N_CLASSES'"
+                    "'TEST.POST_PROCESSING.DET_WATERSHED_DONUTS_CLASSES' length can't be greater than 'DATA.N_CLASSES'"
                 )
-            if np.max(cfg.TEST.POST_PROCESSING.DET_WATERSHED_DONUTS_CLASSES) > cfg.MODEL.N_CLASSES:
+            if np.max(cfg.TEST.POST_PROCESSING.DET_WATERSHED_DONUTS_CLASSES) > cfg.DATA.N_CLASSES:
                 raise ValueError(
-                    "'TEST.POST_PROCESSING.DET_WATERSHED_DONUTS_CLASSES' can not have a class number greater than 'MODEL.N_CLASSES'"
+                    "'TEST.POST_PROCESSING.DET_WATERSHED_DONUTS_CLASSES' can not have a class number greater than 'DATA.N_CLASSES'"
                 )
             min_class = np.min(cfg.TEST.POST_PROCESSING.DET_WATERSHED_DONUTS_CLASSES)
             if not all(
@@ -524,8 +556,8 @@ def check_configuration(cfg, jobname, check_data_paths=True):
             [True if x.lower() in ["accuracy"] else False for x in cfg.TEST.METRICS]
         ), f"'TEST.METRICS' options is 'accuracy' in {cfg.PROBLEM.TYPE} workflow"
 
-        if "top-5-accuracy" in [x.lower() for x in cfg.TRAIN.METRICS] and cfg.MODEL.N_CLASSES < 5:
-            raise ValueError("'top-5-accuracy' can only be used when MODEL.N_CLASSES >= 5")
+        if "top-5-accuracy" in [x.lower() for x in cfg.TRAIN.METRICS] and cfg.DATA.N_CLASSES < 5:
+            raise ValueError("'top-5-accuracy' can only be used when DATA.N_CLASSES >= 5")
 
     loss = ""
     if cfg.PROBLEM.TYPE in [
@@ -539,8 +571,8 @@ def check_configuration(cfg, jobname, check_data_paths=True):
             "W_CE_DICE",
         ], "LOSS.TYPE not in ['CE', 'DICE', 'W_CE_DICE']"
 
-        if cfg.MODEL.N_CLASSES > 2 and loss != "CE":
-            raise ValueError("'MODEL.N_CLASSES' can only be done with 'CE' loss")
+        if cfg.DATA.N_CLASSES > 2 and loss != "CE":
+            raise ValueError("'DATA.N_CLASSES' can only be done with 'CE' loss")
         if loss == "W_CE_DICE":
             assert (
                 len(cfg.LOSS.WEIGHTS) == 2
@@ -571,10 +603,25 @@ def check_configuration(cfg, jobname, check_data_paths=True):
         loss = "CE" if cfg.LOSS.TYPE == "" else cfg.LOSS.TYPE
         assert loss == "CE", "LOSS.TYPE must be 'CE'"
     opts.extend(["LOSS.TYPE", loss])
-    if cfg.LOSS.IGNORE_VALUES:
-        if cfg.LOSS.VALUE_TO_IGNORE != -1 and not check_value(cfg.LOSS.VALUE_TO_IGNORE, (0, 254)):
-            raise ValueError("If 'LOSS.VALUE_TO_IGNORE' is set it needs to be a value in [0,254] range")
+    if cfg.LOSS.IGNORE_INDEX != -1 and not check_value(cfg.LOSS.IGNORE_INDEX, (0, 255)):
+        raise ValueError("If 'LOSS.IGNORE_INDEX' is set it needs to be a value in [0,255] range")
+    if cfg.LOSS.TYPE != "CE":
+        print("WARNING: 'LOSS.IGNORE_INDEX' will not have effect, as it is only working when LOSS.TYPE is 'CE'")
 
+    if cfg.LOSS.CONTRAST.ENABLE:
+        if cfg.LOSS.CONTRAST.MEMORY_SIZE <= 0:
+            raise ValueError("'LOSS.CONTRAST.MEMORY_SIZE' needs to be greater than 0")
+        if cfg.LOSS.CONTRAST.PROJ_DIM <= 0:
+            raise ValueError("'LOSS.CONTRAST.PROJ_DIM' needs to be greater than 0")
+        if cfg.LOSS.CONTRAST.PIXEL_UPD_FREQ <= 0:
+            raise ValueError("'LOSS.CONTRAST.PIXEL_UPD_FREQ' needs to be greater than 0")
+
+        # The models that support contrastive loss are the ones that can be used in these workflows
+        if cfg.PROBLEM.TYPE not in ["SEMANTIC_SEG", "INSTANCE_SEG", "DETECTION"]:
+            raise ValueError(
+                "'LOSS.CONTRAST.ENABLE' can only be set when 'PROBLEM.TYPE' is in ['SEMANTIC_SEG', 'INSTANCE_SEG', 'DETECTION']"
+            )
+        
     if cfg.TEST.ENABLE and cfg.TEST.ANALIZE_2D_IMGS_AS_3D_STACK and cfg.PROBLEM.NDIM == "3D":
         raise ValueError("'TEST.ANALIZE_2D_IMGS_AS_3D_STACK' makes no sense when the problem is 3D. Disable it.")
 
@@ -606,7 +653,7 @@ def check_configuration(cfg, jobname, check_data_paths=True):
             "does not support float16 data type."
         )
 
-    if cfg.MODEL.N_CLASSES > 2 and cfg.PROBLEM.TYPE not in [
+    if cfg.DATA.N_CLASSES > 2 and cfg.PROBLEM.TYPE not in [
         "SEMANTIC_SEG",
         "INSTANCE_SEG",
         "DETECTION",
@@ -614,7 +661,7 @@ def check_configuration(cfg, jobname, check_data_paths=True):
         "IMAGE_TO_IMAGE",
     ]:
         raise ValueError(
-            "'MODEL.N_CLASSES' can only be greater than 2 in the following workflows: 'SEMANTIC_SEG', "
+            "'DATA.N_CLASSES' can only be greater than 2 in the following workflows: 'SEMANTIC_SEG', "
             "'INSTANCE_SEG', 'DETECTION', 'CLASSIFICATION' and 'IMAGE_TO_IMAGE'"
         )
 
@@ -623,8 +670,8 @@ def check_configuration(cfg, jobname, check_data_paths=True):
     #### Semantic segmentation ####
     if cfg.PROBLEM.TYPE == "SEMANTIC_SEG":
         if not model_will_be_read and cfg.MODEL.SOURCE == "biapy":
-            if cfg.MODEL.N_CLASSES < 2:
-                raise ValueError("'MODEL.N_CLASSES' needs to be greater or equal 2 (binary case)")
+            if cfg.DATA.N_CLASSES < 2:
+                raise ValueError("'DATA.N_CLASSES' needs to be greater or equal 2 (binary case)")
         elif cfg.MODEL.SOURCE == "torchvision":
             if cfg.MODEL.TORCHVISION_MODEL_NAME not in [
                 "deeplabv3_mobilenet_v3_large",
@@ -686,7 +733,7 @@ def check_configuration(cfg, jobname, check_data_paths=True):
                 "'PROBLEM.INSTANCE_SEG.DATA_CHANNEL_WEIGHTS' needs to be of the same length as the channels selected in 'PROBLEM.INSTANCE_SEG.DATA_CHANNELS'. "
                 "E.g. 'PROBLEM.INSTANCE_SEG.DATA_CHANNELS'='BC' 'PROBLEM.INSTANCE_SEG.DATA_CHANNEL_WEIGHTS'=[1,0.5]. "
                 "'PROBLEM.INSTANCE_SEG.DATA_CHANNELS'='BCD' 'PROBLEM.INSTANCE_SEG.DATA_CHANNEL_WEIGHTS'=[0.5,0.5,1]. "
-                "If 'MODEL.N_CLASSES' > 2 one more weigth need to be provided."
+                "If 'DATA.N_CLASSES' > 2 one more weigth need to be provided."
             )
         if cfg.TEST.POST_PROCESSING.VORONOI_ON_MASK:
             if cfg.PROBLEM.INSTANCE_SEG.DATA_CHANNELS not in [
@@ -757,8 +804,8 @@ def check_configuration(cfg, jobname, check_data_paths=True):
 
     #### Detection ####
     if cfg.PROBLEM.TYPE == "DETECTION":
-        if not model_will_be_read and cfg.MODEL.SOURCE == "biapy" and cfg.MODEL.N_CLASSES < 2:
-            raise ValueError("'MODEL.N_CLASSES' needs to be greater or equal 2 (binary case)")
+        if not model_will_be_read and cfg.MODEL.SOURCE == "biapy" and cfg.DATA.N_CLASSES < 2:
+            raise ValueError("'DATA.N_CLASSES' needs to be greater or equal 2 (binary case)")
 
         cpd = cfg.PROBLEM.DETECTION.CENTRAL_POINT_DILATION
         if len(cpd) == 1:
@@ -1197,7 +1244,7 @@ def check_configuration(cfg, jobname, check_data_paths=True):
             if cfg.DATA.TEST.LOAD_GT or cfg.DATA.TEST.USE_VAL_AS_TEST:
                 use_gt = True
                 
-            expected_classes = cfg.MODEL.N_CLASSES if use_gt else 1
+            expected_classes = cfg.DATA.N_CLASSES if use_gt else 1
             list_of_classes = sorted(next(os_walk_clean(cfg.DATA.TEST.PATH))[1])
             if len(list_of_classes) < 1:
                 raise ValueError("There is no folder/class for test in {}".format(cfg.DATA.TEST.PATH))
@@ -1206,10 +1253,10 @@ def check_configuration(cfg, jobname, check_data_paths=True):
                 if expected_classes != len(list_of_classes):
                     if use_gt:
                         mess = f"Found {len(list_of_classes)} number of classes for test (folders: {list_of_classes}) "\
-                        + f"but 'MODEL.N_CLASSES' was set to {expected_classes}. They must match. Aborting..."
+                        + f"but 'DATA.N_CLASSES' was set to {expected_classes}. They must match. Aborting..."
                     else:
                         mess = f"Found {len(list_of_classes)} number of classes for test (folders: {list_of_classes}) "\
-                        + f"but 'MODEL.N_CLASSES' was set to 1 because 'DATA.TEST.LOAD_GT' is False, so a unique folder "\
+                        + f"but 'DATA.N_CLASSES' was set to 1 because 'DATA.TEST.LOAD_GT' is False, so a unique folder "\
                         + "containing all the samples is expected. Aborting..."
                     raise ValueError(mess)
                 else:
@@ -1225,8 +1272,8 @@ def check_configuration(cfg, jobname, check_data_paths=True):
                 ], "'TEST.BY_CHUNKS.WORKFLOW_PROCESS.TYPE' needs to be in ['chunk_by_chunk', 'entire_pred']"
             if len(cfg.DATA.TEST.INPUT_IMG_AXES_ORDER) < 3:
                 raise ValueError("'DATA.TEST.INPUT_IMG_AXES_ORDER' needs to be at least of length 3, e.g., 'ZYX'")
-            if cfg.MODEL.N_CLASSES > 2:
-                raise ValueError("Not implemented pipeline option: 'MODEL.N_CLASSES' > 2 and 'TEST.BY_CHUNKS'")
+            if cfg.DATA.N_CLASSES > 2:
+                raise ValueError("Not implemented pipeline option: 'DATA.N_CLASSES' > 2 and 'TEST.BY_CHUNKS'")
             if cfg.DATA.TEST.INPUT_ZARR_MULTIPLE_DATA:
                 if cfg.DATA.TEST.INPUT_ZARR_MULTIPLE_DATA_RAW_PATH == "":
                     raise ValueError(
@@ -1433,7 +1480,12 @@ def check_configuration(cfg, jobname, check_data_paths=True):
             "mae",
             "unext_v1",
             "unext_v2",
-        ], "MODEL.ARCHITECTURE not in ['unet', 'resunet', 'resunet++', 'attention_unet', 'multiresunet', 'seunet', 'simple_cnn', 'efficientnet_b[0-7]', 'unetr', 'edsr', 'rcan', 'dfcan', 'wdsr', 'vit', 'mae', 'unext_v1', 'unext_v2']"
+            "hrnet18",
+            "hrnet32",
+            "hrnet48",
+            "hrnet64",
+            "hrnet2x20",
+        ], "MODEL.ARCHITECTURE not in ['unet', 'resunet', 'resunet++', 'attention_unet', 'multiresunet', 'seunet', 'simple_cnn', 'efficientnet_b[0-7]', 'unetr', 'edsr', 'rcan', 'dfcan', 'wdsr', 'vit', 'mae', 'unext_v1', 'unext_v2', 'hrnet18', 'hrnet32', 'hrnet48', 'hrnet64', 'hrnet2x20']"
         if (
             model_arch
             not in [
@@ -1451,6 +1503,11 @@ def check_configuration(cfg, jobname, check_data_paths=True):
                 "unext_v2",
                 "dfcan",
                 "rcan",
+                "hrnet18",
+                "hrnet32",
+                "hrnet48",
+                "hrnet64",
+                "hrnet2x20",
             ]
             and cfg.PROBLEM.NDIM == "3D"
             and cfg.PROBLEM.TYPE != "CLASSIFICATION"
@@ -1472,11 +1529,16 @@ def check_configuration(cfg, jobname, check_data_paths=True):
                         "unext_v2",
                         "dfcan",
                         "rcan",
+                        "hrnet18",
+                        "hrnet32",
+                        "hrnet48",
+                        "hrnet64",
+                        "hrnet2x20",
                     ]
                 )
             )
         if (
-            cfg.MODEL.N_CLASSES > 2
+            cfg.DATA.N_CLASSES > 2
             and cfg.PROBLEM.TYPE != "CLASSIFICATION"
             and model_arch
             not in [
@@ -1490,47 +1552,52 @@ def check_configuration(cfg, jobname, check_data_paths=True):
                 "unetr",
                 "unext_v1",
                 "unext_v2",
+                "hrnet18",
+                "hrnet32",
+                "hrnet48",
+                "hrnet64",
+                "hrnet2x20",
             ]
         ):
             raise ValueError(
-                "'MODEL.N_CLASSES' > 2 can only be used with 'MODEL.ARCHITECTURE' in ['unet', 'resunet', 'resunet++', 'seunet', 'resunet_se', 'attention_unet', 'multiresunet', 'unetr', 'unext_v1', 'unext_v2']"
+                "'DATA.N_CLASSES' > 2 can only be used with 'MODEL.ARCHITECTURE' in ['unet', 'resunet', 'resunet++', 'seunet', 'resunet_se', 'attention_unet', 'multiresunet', 'unetr', 'unext_v1', 'unext_v2', 'hrnet18', 'hrnet32', 'hrnet48', 'hrnet64', 'hrnet2x20']"
             )
 
         assert len(cfg.MODEL.FEATURE_MAPS) > 2, "'MODEL.FEATURE_MAPS' needs to have at least 3 values"
 
-        # Adjust dropout to feature maps
-        if model_arch in ["vit", "unetr", "mae"]:
+    # Adjust dropout to feature maps
+    if model_arch in ["vit", "unetr", "mae"]:
+        if all(x == 0 for x in cfg.MODEL.DROPOUT_VALUES):
+            opts.extend(["MODEL.DROPOUT_VALUES", (0.0,)])
+        elif len(cfg.MODEL.DROPOUT_VALUES) != 1:
+            raise ValueError(
+                "'MODEL.DROPOUT_VALUES' must be list of an unique number when 'MODEL.ARCHITECTURE' is one among ['vit', 'mae', 'unetr']"
+            )
+        elif not check_value(cfg.MODEL.DROPOUT_VALUES[0]):
+            raise ValueError("'MODEL.DROPOUT_VALUES' not in [0, 1] range")
+    else:
+        if len(cfg.MODEL.FEATURE_MAPS) != len(cfg.MODEL.DROPOUT_VALUES):
             if all(x == 0 for x in cfg.MODEL.DROPOUT_VALUES):
-                opts.extend(["MODEL.DROPOUT_VALUES", (0.0,)])
-            elif len(cfg.MODEL.DROPOUT_VALUES) != 1:
-                raise ValueError(
-                    "'MODEL.DROPOUT_VALUES' must be list of an unique number when 'MODEL.ARCHITECTURE' is one among ['vit', 'mae', 'unetr']"
-                )
-            elif not check_value(cfg.MODEL.DROPOUT_VALUES[0]):
+                opts.extend(["MODEL.DROPOUT_VALUES", (0.0,) * len(cfg.MODEL.FEATURE_MAPS)])
+            elif any(not check_value(x) for x in cfg.MODEL.DROPOUT_VALUES):
                 raise ValueError("'MODEL.DROPOUT_VALUES' not in [0, 1] range")
-        else:
-            if len(cfg.MODEL.FEATURE_MAPS) != len(cfg.MODEL.DROPOUT_VALUES):
-                if all(x == 0 for x in cfg.MODEL.DROPOUT_VALUES):
-                    opts.extend(["MODEL.DROPOUT_VALUES", (0.0,) * len(cfg.MODEL.FEATURE_MAPS)])
-                elif any(not check_value(x) for x in cfg.MODEL.DROPOUT_VALUES):
-                    raise ValueError("'MODEL.DROPOUT_VALUES' not in [0, 1] range")
-                else:
-                    raise ValueError("'MODEL.FEATURE_MAPS' and 'MODEL.DROPOUT_VALUES' lengths must be equal")
+            else:
+                raise ValueError("'MODEL.FEATURE_MAPS' and 'MODEL.DROPOUT_VALUES' lengths must be equal")
 
-        # Adjust Z_DOWN values to feature maps
-        if all(x == 0 for x in cfg.MODEL.Z_DOWN):
-            opts.extend(["MODEL.Z_DOWN", (2,) * (len(cfg.MODEL.FEATURE_MAPS) - 1)])
-        elif any([False for x in cfg.MODEL.Z_DOWN if x != 1 and x != 2]):
-            raise ValueError("'MODEL.Z_DOWN' needs to be 1 or 2")
-        else:
-            if model_arch == "multiresunet" and len(cfg.MODEL.Z_DOWN) != 4:
-                raise ValueError("'MODEL.Z_DOWN' length must be 4 when using 'multiresunet'")
-            elif len(cfg.MODEL.FEATURE_MAPS) - 1 != len(cfg.MODEL.Z_DOWN):
-                raise ValueError("'MODEL.FEATURE_MAPS' length minus one and 'MODEL.Z_DOWN' length must be equal")
+    # Adjust Z_DOWN values to feature maps
+    if all(x == 0 for x in cfg.MODEL.Z_DOWN):
+        opts.extend(["MODEL.Z_DOWN", (2,) * (len(cfg.MODEL.FEATURE_MAPS) - 1)])
+    elif any([False for x in cfg.MODEL.Z_DOWN if x != 1 and x != 2]):
+        raise ValueError("'MODEL.Z_DOWN' needs to be 1 or 2")
+    else:
+        if model_arch == "multiresunet" and len(cfg.MODEL.Z_DOWN) != 4:
+            raise ValueError("'MODEL.Z_DOWN' length must be 4 when using 'multiresunet'")
+        elif len(cfg.MODEL.FEATURE_MAPS) - 1 != len(cfg.MODEL.Z_DOWN):
+            raise ValueError("'MODEL.FEATURE_MAPS' length minus one and 'MODEL.Z_DOWN' length must be equal")
 
-        # Adjust ISOTROPY values to feature maps
-        if all(x == True for x in cfg.MODEL.ISOTROPY):
-            opts.extend(["MODEL.ISOTROPY", (True,) * (len(cfg.MODEL.FEATURE_MAPS))])
+    # Adjust ISOTROPY values to feature maps
+    if all(x == True for x in cfg.MODEL.ISOTROPY):
+        opts.extend(["MODEL.ISOTROPY", (True,) * (len(cfg.MODEL.FEATURE_MAPS))])
 
     # Correct UPSCALING for other workflows than SR
     if len(cfg.PROBLEM.SUPER_RESOLUTION.UPSCALING) == 0:
@@ -1563,9 +1630,14 @@ def check_configuration(cfg, jobname, check_data_paths=True):
                 "multiresunet",
                 "unext_v1",
                 "unext_v2",
+                "hrnet18",
+                "hrnet32",
+                "hrnet48",
+                "hrnet64",
+                "hrnet2x20",
             ]:
                 raise ValueError(
-                    "Architectures available for {} are: ['unet', 'resunet', 'resunet++', 'seunet', 'attention_unet', 'resunet_se', 'unetr', 'multiresunet', 'unext_v1', 'unext_v2']".format(
+                    "Architectures available for {} are: ['unet', 'resunet', 'resunet++', 'seunet', 'attention_unet', 'resunet_se', 'unetr', 'multiresunet', 'unext_v1', 'unext_v2', 'hrnet18', 'hrnet32', 'hrnet48', 'hrnet64', 'hrnet2x20']".format(
                         cfg.PROBLEM.TYPE
                     )
                 )
@@ -1612,9 +1684,14 @@ def check_configuration(cfg, jobname, check_data_paths=True):
                 "multiresunet",
                 "unext_v1",
                 "unext_v2",
+                "hrnet18",
+                "hrnet32",
+                "hrnet48",
+                "hrnet64",
+                "hrnet2x20",
             ]:
                 raise ValueError(
-                    "Architectures available for 'IMAGE_TO_IMAGE' are: ['edsr', 'rcan', 'dfcan', 'wdsr', 'unet', 'resunet', 'resunet++', 'resunet_se', 'seunet', 'attention_unet', 'unetr', 'multiresunet', 'unext_v1', 'unext_v2']"
+                    "Architectures available for 'IMAGE_TO_IMAGE' are: ['edsr', 'rcan', 'dfcan', 'wdsr', 'unet', 'resunet', 'resunet++', 'resunet_se', 'seunet', 'attention_unet', 'unetr', 'multiresunet', 'unext_v1', 'unext_v2', 'hrnet18', 'hrnet32', 'hrnet48', 'hrnet64', 'hrnet2x20']"
                 )
             # Not allowed archs
             if cfg.PROBLEM.NDIM == "3D" and model_arch == "wdsr":
@@ -1637,10 +1714,15 @@ def check_configuration(cfg, jobname, check_data_paths=True):
                 "wdsr",
                 "vit",
                 "mae",
+                "hrnet18",
+                "hrnet32",
+                "hrnet48",
+                "hrnet64",
+                "hrnet2x20",
             ]:
                 raise ValueError(
                     "'SELF_SUPERVISED' models available are these: ['unet', 'resunet', 'resunet++', 'attention_unet', 'multiresunet', 'seunet', 'resunet_se', "
-                    "'unetr', 'unext_v1', 'edsr', 'rcan', 'dfcan', 'wdsr', 'vit', 'mae']"
+                    "'unetr', 'unext_v1', 'unext_v2', 'edsr', 'rcan', 'dfcan', 'wdsr', 'vit', 'mae', 'hrnet18', 'hrnet32', 'hrnet48', 'hrnet64', 'hrnet2x20']"
                 )
 
             # Not allowed archs
@@ -1674,24 +1756,55 @@ def check_configuration(cfg, jobname, check_data_paths=True):
             "multiresunet",
             "unext_v1",
             "unext_v2",
+            "hrnet18",
+            "hrnet32",
+            "hrnet48",
+            "hrnet64",
+            "hrnet2x20",
         ]:
             z_size = cfg.DATA.PATCH_SIZE[0]
             sizes = cfg.DATA.PATCH_SIZE[1:-1]
-            for i in range(len(cfg.MODEL.FEATURE_MAPS) - 1):
-                if not all(
-                    [False for x in sizes if x % (np.power(2, (i + 1))) != 0 or z_size % cfg.MODEL.Z_DOWN[i] != 0]
-                ):
-                    m = (
-                        "The 'DATA.PATCH_SIZE' provided is not divisible by 2 in each of the U-Net's levels. You can:\n 1) Reduce the number "
-                        + "of levels (by reducing 'cfg.MODEL.FEATURE_MAPS' array's length)\n 2) Increase 'DATA.PATCH_SIZE'"
-                    )
-                    if cfg.PROBLEM.NDIM == "3D":
-                        m += (
-                            "\n 3) If the Z axis is the problem, as the patch size is normally less than in other axis due to resolution, you "
-                            + "can tune 'MODEL.Z_DOWN' variable to not downsample the image in all U-Net levels"
+
+            if "hrnet" not in model_arch:
+                for i in range(len(cfg.MODEL.FEATURE_MAPS) - 1):
+                    if not all(
+                        [False for x in sizes if x % (np.power(2, (i + 1))) != 0 or z_size % cfg.MODEL.Z_DOWN[i] != 0]
+                    ):
+                        m = (
+                            "The 'DATA.PATCH_SIZE' provided is not divisible by 2 in each of the U-Net's levels. You can:\n 1) Reduce the number "
+                            + "of levels (by reducing 'cfg.MODEL.FEATURE_MAPS' array's length)\n 2) Increase 'DATA.PATCH_SIZE'"
                         )
-                    raise ValueError(m)
-                z_size = z_size // cfg.MODEL.Z_DOWN[i]
+                        if cfg.PROBLEM.NDIM == "3D":
+                            m += (
+                                "\n 3) If the Z axis is the problem, as the patch size is normally less than in other axis due to resolution, you "
+                                + "can tune 'MODEL.Z_DOWN' variable to not downsample the image in all U-Net levels"
+                            )
+                        raise ValueError(m)
+                    z_size = z_size // cfg.MODEL.Z_DOWN[i]
+            else:
+                
+                # Check that the input patch size is divisible in every level of the HRNet's like architectures
+                _mod = model_arch.upper()
+                _mod = re.sub(r'HRNET(\d+)', r'HRNET_\1', _mod)
+                _mod = _mod.replace("X", "_X")
+                hrnet_zdown = getattr(cfg.MODEL, _mod).Z_DOWN
+                hrnet_zdown_div = 2 if hrnet_zdown else 1
+
+                for i in range(4):
+                    if not all(
+                        [False for x in sizes if x % (np.power(2, (i + 1))) != 0 or z_size % hrnet_zdown_div != 0]
+                    ):
+                        m = (
+                            f"The 'DATA.PATCH_SIZE' provided is not divisible by 2 in each of the {_mod}'s levels. You can:\n 1) Reduce the number "
+                            + "of levels (by reducing 'cfg.MODEL.FEATURE_MAPS' array's length)\n 2) Increase 'DATA.PATCH_SIZE'"
+                        )
+                        if cfg.PROBLEM.NDIM == "3D":
+                            m += (
+                                "\n 3) If the Z axis is the problem, as the patch size is normally less than in other axis due to resolution, you "
+                                + f"can tune 'MODEL.{_mod}.Z_DOWN' variable to not downsample the image in all U-Net levels"
+                            )
+                        raise ValueError(m)
+                    z_size = z_size // 2 if hrnet_zdown else z_size
 
     if cfg.MODEL.LOAD_CHECKPOINT and check_data_paths:
         if not os.path.exists(get_checkpoint_path(cfg, jobname)):
@@ -1892,18 +2005,37 @@ def check_configuration(cfg, jobname, check_data_paths=True):
 
 def compare_configurations_without_model(actual_cfg, old_cfg, header_message="", old_cfg_version=None):
     """
-    Compares two configurations and throws an error if they differ in some critical variables that change workflow behaviour. This
-    comparisdon does not take into account model specs.
+    Compare two BiaPy configurations and raise an error if critical workflow variables differ.
+
+    This function checks that key configuration variables (such as problem type, patch size,
+    number of classes, and data channels) match between the current and previous configuration.
+    It ignores model-specific parameters and allows for some backward compatibility.
+
+    Parameters
+    ----------
+    actual_cfg : yacs.config.CfgNode
+        The current configuration object.
+    old_cfg : yacs.config.CfgNode or dict
+        The previous configuration object to compare against.
+    header_message : str, optional
+        Message to prepend to any error or warning (default: "").
+    old_cfg_version : str or None, optional
+        Version string of the old configuration, for backward compatibility (default: None).
+
+    Raises
+    ------
+    ValueError
+        If a critical configuration variable does not match and cannot be ignored.
     """
     print("Comparing configurations . . .")
 
     vars_to_compare = [
         "PROBLEM.TYPE",
         "PROBLEM.NDIM",
-        # "DATA.PATCH_SIZE",
+        "DATA.PATCH_SIZE",
         "PROBLEM.INSTANCE_SEG.DATA_CHANNELS",
         "PROBLEM.SUPER_RESOLUTION.UPSCALING",
-        "MODEL.N_CLASSES",
+        "DATA.N_CLASSES",
     ]
 
     def get_attribute_recursive(var, attr):
@@ -1926,29 +2058,38 @@ def compare_configurations_without_model(actual_cfg, old_cfg, header_message="",
         current_value = get_attribute_recursive(actual_cfg, var_to_compare)
         old_value = get_attribute_recursive(old_cfg, var_to_compare)
         if current_value != old_value:
-            full_message = ""
-            if var_to_compare == "MODEL.N_CLASSES":
+            error_message, warning_message = "", ""
+            if var_to_compare == "DATA.N_CLASSES":
                 if not actual_cfg.MODEL.SKIP_UNMATCHED_LAYERS:
-                    full_message = header_message \
+                    error_message = header_message \
                         + f"The '{var_to_compare}' value of the compared configurations does not match: " \
                         + f"{current_value} (current configuration) vs {old_value} (from loaded configuration). " \
                         + "If you want to load all weights from the checkpoint that match in shape with your model " \
                         + "(e.g., to fine-tune the head), set 'MODEL.SKIP_UNMATCHED_LAYERS' to True."
             # Allow SSL pretrainings
             elif not (var_to_compare == "PROBLEM.TYPE" and old_value == "SELF_SUPERVISED"):
-                full_message = header_message \
+                error_message = header_message \
                     + f"The '{var_to_compare}' value of the compared configurations does not match: " \
                     + f"{current_value} (current configuration) vs {old_value} (from loaded configuration)"
-
-            if full_message != "":
-                raise ValueError( full_message )
-
+            elif var_to_compare == "DATA.PATCH_SIZE" and any([new for new, old in zip(current_value,old_value) if new < old]):
+                warning_message = \
+                    + f"WARNING: The 'DATA.PATCH_SIZE' value used for training the model that you are trying to load was {old_value}." \
+                    + f"It seems that one of the values in your 'DATA.PATCH_SIZE', which is {current_value}, is smaller so may be causing " \
+                    + "an error during model building process"
+                
+            if error_message != "":
+                raise ValueError( error_message )
+            if warning_message != "":
+                print( warning_message )
+            
     print("Configurations seem to be compatible. Continuing . . .")
 
 
 def convert_old_model_cfg_to_current_version(old_cfg: dict):
     """
-    Backward compatibility until commit 6aa291baa9bc5d7fb410454bfcea3a3da0c23604 (version 3.2.0)
+    Convert old configuration to the current BiaPy version.
+    
+    Backward compatibility until commit 6aa291baa9bc5d7fb410454bfcea3a3da0c23604 (version 3.2.0).
     Commit url: https://github.com/BiaPyX/BiaPy/commit/6aa291baa9bc5d7fb410454bfcea3a3da0c23604
 
     Parameters
@@ -2167,6 +2308,12 @@ def convert_old_model_cfg_to_current_version(old_cfg: dict):
                 old_cfg["MODEL"]["NORMALIZATION"] = "bn"
             del old_cfg["MODEL"]["BATCH_NORMALIZATION"]
 
+        if "N_CLASSES" in old_cfg["MODEL"]:
+            if "DATA" not in old_cfg:
+                old_cfg["DATA"] = {}
+            old_cfg["DATA"]["N_CLASSES"] = old_cfg["MODEL"]["N_CLASSES"]
+            del old_cfg["MODEL"]["N_CLASSES"]
+
         if "BMZ" in old_cfg["MODEL"]:
             if "SOURCE_MODEL_DOI" in old_cfg["MODEL"]["BMZ"]:
                 model = old_cfg["MODEL"]["BMZ"]["SOURCE_MODEL_DOI"]
@@ -2254,7 +2401,7 @@ def convert_old_model_cfg_to_current_version(old_cfg: dict):
 
 def diff_between_configs(old_dict: Dict | Config, new_dict: Dict | Config, path: str=""):
     """
-    Print differences between tow given configurations. 
+    Print differences between two given configurations.
 
     Paramaters
     ----------

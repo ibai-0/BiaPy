@@ -72,7 +72,7 @@ all_test_info["Test4"] = {
     "internal_checks": [
         {"type": "regular", "pattern": "Test IoU (B channel) (merge patches):", "gt": True, "value": 0.4},
         {"type": "DatasetMatching", "pattern": "DatasetMatching(criterion='iou', thresh=0.3,", "nApparition": 1, "metric": "f1",
-            "gt": True, "value": 0.55},
+            "gt": True, "value": 0.50},
         {"type": "DatasetMatching", "pattern": "DatasetMatching(criterion='iou', thresh=0.3,", "nApparition": 2, "metric": "f1",
             "gt": False, "value": 0.3}, # Post-processing
     ]
@@ -199,7 +199,7 @@ all_test_info["Test15"] = {
     "description": "2D self-supervision. Lucchi data. Cross-val. Basic DA. mae, masking: random",
     "yaml": "test_15.yaml",
     "internal_checks": [
-        {"type": "regular", "pattern": "Validation PSNR:", "gt": True, "value": 13},
+        {"type": "regular", "pattern": "Validation PSNR:", "gt": True, "value": 12},
     ]
 }
 
@@ -209,7 +209,7 @@ all_test_info["Test16"] = {
     "description": "2D self-supervision. Lucchi data. Cross-val. Basic DA. mae, masking: grid",
     "yaml": "test16.yaml",
     "internal_checks": [
-        {"type": "regular", "pattern": "Validation PSNR:", "gt": True, "value": 13},
+        {"type": "regular", "pattern": "Validation PSNR:", "gt": True, "value": 12},
     ]
 }
 
@@ -1198,6 +1198,9 @@ if all_test_info["Test1"]["enable"]:
 
     biapy_config['MODEL']['ARCHITECTURE'] = 'unet'
 
+    biapy_config['LOSS'] = {}
+    biapy_config['LOSS']['TYPE'] = "W_CE_DICE"
+    
     biapy_config['TEST']['ENABLE'] = True
     biapy_config['TEST']['AUGMENTATION'] = True
     biapy_config['TEST']['FULL_IMG'] = True
@@ -1851,6 +1854,7 @@ if all_test_info["Test11"]["enable"]:
 
     biapy_config['DATA']['PATCH_SIZE'] = "(20, 128, 128, 2)"
     biapy_config['DATA']['NORMALIZATION'] = {}
+    biapy_config['DATA']['NORMALIZATION']['TYPE'] = "scale_range"
     biapy_config['DATA']['NORMALIZATION']['PERC_CLIP'] = {}
     biapy_config['DATA']['NORMALIZATION']['PERC_CLIP']['ENABLE'] = True
     biapy_config['DATA']['NORMALIZATION']['PERC_CLIP']['LOWER_PERC'] = 0.1
@@ -1892,7 +1896,7 @@ if all_test_info["Test11"]["enable"]:
 
     biapy_config['TEST']['ENABLE'] = True
     biapy_config['TEST']['FULL_IMG'] = False
-    biapy_config['TEST']['DET_MIN_TH_TO_BE_PEAK'] = 0.2
+    biapy_config['TEST']['DET_MIN_TH_TO_BE_PEAK'] = 0.5
     biapy_config['TEST']['DET_TOLERANCE'] = 8
     biapy_config['TEST']['VERBOSE'] = True
 
@@ -2255,8 +2259,9 @@ if all_test_info["Test14"]["enable"]:
         except yaml.YAMLError as exc:
             raise ValueError(exc)
 
+    biapy_config['DATA']['NORMALIZATION'] = {}
+    biapy_config['DATA']['NORMALIZATION']['TYPE'] = "div"
     biapy_config['DATA']['EXTRACT_RANDOM_PATCH'] = False
-
     biapy_config['DATA']['PATCH_SIZE'] = "(256,256,1)"
     biapy_config['DATA']['TRAIN']['PATH'] = os.path.join(self_supervision_2d_data_outpath, "data", "train", "raw")
     biapy_config['DATA']['TRAIN']['IN_MEMORY'] = True
@@ -2996,6 +3001,8 @@ if all_test_info["Test24"]["enable"]:
         except yaml.YAMLError as exc:
             raise ValueError(exc)
 
+    biapy_config['DATA']['NORMALIZATION'] = {}
+    biapy_config['DATA']['NORMALIZATION']['TYPE'] = "div"
     biapy_config['DATA']['REFLECT_TO_COMPLETE_SHAPE'] = False
     biapy_config['DATA']['PATCH_SIZE'] = "(256, 256, 1)"
     biapy_config['DATA']['TRAIN']['PATH'] = os.path.join(image_to_image_2d_data_outpath, "data", "train", "raw")

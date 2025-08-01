@@ -1,3 +1,11 @@
+"""
+Base workflow class for BiaPy.
+
+This module defines the Base_Workflow abstract class, which provides the main
+structure and utility methods for building training and inference workflows in BiaPy.
+It handles configuration, model preparation, data loading, training, testing,
+metrics, logging, and post-processing for both 2D and 3D biomedical image analysis.
+"""
 import math
 import os
 import datetime
@@ -69,6 +77,7 @@ from biapy.data.data_manipulation import (
     load_and_prepare_test_data,
     read_img_as_ndarray,
     save_tif,
+    resize,
 )
 from biapy.data.post_processing.post_processing import (
     ensemble8_2d_predictions,
@@ -80,6 +89,7 @@ from biapy.data.pre_processing import preprocess_data
 from biapy.data.norm import Normalization
 from biapy.data.generators.chunked_test_pair_data_generator import chunked_test_pair_data_generator
 from biapy.data.dataset import PatchCoords
+from biapy.models.memory_bank import MemoryBank
 
 
 class Base_Workflow(metaclass=ABCMeta):
@@ -108,6 +118,23 @@ class Base_Workflow(metaclass=ABCMeta):
         device: torch.device,
         args: argparse.Namespace,
     ):
+        """
+        Initialize the Base_Workflow object.
+
+        Sets up configuration, device, job identifier, and initializes
+        all workflow attributes and state variables.
+
+        Parameters
+        ----------
+        cfg : CN
+            Running configuration.
+        job_identifier : str
+            Complete name of the running job.
+        device : torch.device
+            Device used.
+        args : argparse.Namespace
+            Arguments used in BiaPy's call.
+        """
         self.cfg = cfg
         self.args = args
         self.job_identifier = job_identifier
@@ -175,6 +202,8 @@ class Base_Workflow(metaclass=ABCMeta):
         self.test_metric_best = []
         self.test_metric_names = []
         self.loss = None
+        self.memory_bank = None
+        self.real_classes = -1 
 
         self.resolution: List[int | float] = list(self.cfg.DATA.TEST.RESOLUTION)
         if self.cfg.PROBLEM.NDIM == "2D":
@@ -255,6 +284,8 @@ class Base_Workflow(metaclass=ABCMeta):
 
     def define_activations_and_channels(self):
         """
+        Define the activations to be applied to the model output and the channels that the model will output.
+
         This function must define the following variables:
 
         self.model_output_channels : List of functions
@@ -290,9 +321,15 @@ class Base_Workflow(metaclass=ABCMeta):
             for x in self.activations:
                 if not isinstance(x, dict):
                     raise ValueError("'self.activations' must be a list of dicts")
+        if self.real_classes == -1:
+            raise ValueError(
+                "'real_classes' needs to be defined. Correct define_activations_and_channels() function"
+            )
 
-    def define_metrics(self):
+    def define_metrics(self):   
         """
+        Define the metrics to be calculated during training and test.
+
         This function must define the following variables:
 
         self.train_metrics : List of functions
@@ -339,7 +376,7 @@ class Base_Workflow(metaclass=ABCMeta):
         metric_logger: Optional[MetricLogger] = None,
     ) -> Dict:
         """
-        Execution of the metrics defined in :func:`~define_metrics` function.
+        Execute the calculation of metrics defined in :func:`~define_metrics` function.
 
         Parameters
         ----------
@@ -364,8 +401,7 @@ class Base_Workflow(metaclass=ABCMeta):
 
     def prepare_targets(self, targets, batch):
         """
-        Location to perform any necessary data transformations to ``targets``
-        before calculating the loss.
+        Location to perform any necessary data transformations to ``targets`` before calculating the loss.
 
         Parameters
         ----------
@@ -384,9 +420,7 @@ class Base_Workflow(metaclass=ABCMeta):
         return to_pytorch_format(targets, self.axes_order, self.device)
 
     def load_train_data(self):
-        """
-        Load training and validation data.
-        """
+        """Load training and validation data."""
         print("##########################")
         print("#   LOAD TRAINING DATA   #")
         print("##########################")
@@ -477,9 +511,7 @@ class Base_Workflow(metaclass=ABCMeta):
             dist.barrier()
 
     def destroy_train_data(self):
-        """
-        Delete training variable to release memory.
-        """
+        """Delete training variables to release memory."""
         print("Releasing memory . . .")
         if "X_train" in locals() or "X_train" in globals():
             del self.X_train
@@ -495,9 +527,7 @@ class Base_Workflow(metaclass=ABCMeta):
             del self.val_generator
 
     def prepare_train_generators(self):
-        """
-        Build train and val generators.
-        """
+        """Build training and validation generators."""
         if self.cfg.TRAIN.ENABLE:
             print("##############################")
             print("#  PREPARE TRAIN GENERATORS  #")
@@ -622,19 +652,34 @@ class Base_Workflow(metaclass=ABCMeta):
 
         if self.cfg.MODEL.SOURCE == "biapy":
             assert self.model
-            p = self.model(in_img)
+            pred = self.model(in_img)
+
+            # Recover the original shape of the input, as not all the model return a prediction
+            # of the same size as the input image
+            if (
+                not (self.cfg.LOSS.CONTRAST.ENABLE and is_train)
+                and not (self.cfg.PROBLEM.TYPE == "SELF_SUPERVISED" and self.cfg.PROBLEM.SELF_SUPERVISED.PRETEXT_TASK.lower() == "masking") 
+                and self.cfg.PROBLEM.TYPE not in ["CLASSIFICATION", "SUPER_RESOLUTION"]
+            ):
+                if isinstance(pred, dict):
+                    if pred["pred"].shape[2:] != in_img.shape[2:]:
+                        mode = "bilinear" if self.cfg.PROBLEM.NDIM == "2D" else "trilinear"
+                        pred["pred"] = resize(pred["pred"], in_img.shape, mode=mode)
+                    if "class" in pred:
+                        pred["class"] = resize(pred["class"], in_img.shape, mode="nearest")
+                else:
+                    if pred.shape[2:] != in_img.shape[2:]:
+                        pred = resize(pred, in_img.shape, mode="bilinear")
             if apply_act:
-                p = self.apply_model_activations(p, training=is_train)
+                pred = self.apply_model_activations(pred, training=is_train)
         elif self.cfg.MODEL.SOURCE == "bmz":
-            p = self.bmz_model_call(in_img, is_train)
+            pred = self.bmz_model_call(in_img, is_train)
         elif self.cfg.MODEL.SOURCE == "torchvision":
-            p = self.torchvision_model_call(in_img, is_train)
-        return p
+            pred = self.torchvision_model_call(in_img, is_train)
+        return pred
 
     def prepare_model(self):
-        """
-        Build the model.
-        """
+        """Build the model."""
         if self.model_prepared:
             print("Model already prepared!")
             return
@@ -657,27 +702,29 @@ class Base_Workflow(metaclass=ABCMeta):
                 if saved_cfg:
                     # Checks that this config and previous represent same workflow
                     header_message = "There is an inconsistency between the configuration loaded from checkpoint and the actual one. Error:\n"
+                    tmp_cfg = convert_old_model_cfg_to_current_version(saved_cfg.clone())
                     compare_configurations_without_model(
-                        self.cfg, saved_cfg, header_message, old_cfg_version=biapy_ckpt_version
+                        self.cfg, tmp_cfg, header_message, old_cfg_version=biapy_ckpt_version
                     )
 
                     # Override model specs
-                    tmp_cfg = convert_old_model_cfg_to_current_version(saved_cfg.clone())
                     if self.cfg.PROBLEM.PRINT_OLD_KEY_CHANGES:
                         print("The following changes were made in order to adapt the loaded input configuration from checkpoint into the current configuration version:")
                         diff_between_configs(saved_cfg, tmp_cfg)
                     update_dict_with_existing_keys(self.cfg["MODEL"], tmp_cfg["MODEL"])
 
                     # Check if the merge is coherent
-                    updated_config = self.cfg.clone()
-                    updated_config["MODEL"]["LOAD_MODEL_FROM_CHECKPOINT"] = False
                     self.cfg["MODEL"]["LOAD_CHECKPOINT"] = True
-                    check_configuration(updated_config, self.job_identifier)
+                    self.cfg["MODEL"]["LOAD_MODEL_FROM_CHECKPOINT"] = False
+                    check_configuration(self.cfg, self.job_identifier)
             (
                 self.model,
-                self.bmz_config["model_file"],
-                self.bmz_config["model_name"],
+                self.bmz_config["callable_model"],
+                self.bmz_config["collected_sources"],
+                self.bmz_config["all_import_lines"],
+                self.bmz_config["scanned_files"],
                 self.model_build_kwargs,
+                self.network_stride,
             ) = build_model(self.cfg, self.model_output_channels["channels"], self.device)
         elif self.cfg.MODEL.SOURCE == "torchvision":
             self.model, self.torchvision_preprocessing = build_torchvision_model(self.cfg, self.device)
@@ -730,9 +777,7 @@ class Base_Workflow(metaclass=ABCMeta):
             self.start_epoch = 0
 
     def prepare_logging_tool(self):
-        """
-        Prepare looging tool.
-        """
+        """Prepare looging tool."""
         print("#######################")
         print("# Prepare logging tool #")
         print("#######################")
@@ -758,9 +803,7 @@ class Base_Workflow(metaclass=ABCMeta):
             self.plot_values["val_" + self.train_metric_names[i]] = []
 
     def train(self):
-        """
-        Training phase.
-        """
+        """Training phase."""
         self.load_train_data()
         if not self.model_prepared:
             self.prepare_model()
@@ -775,6 +818,23 @@ class Base_Workflow(metaclass=ABCMeta):
             self.cfg, self.model_without_ddp, len(self.train_generator)
         )
 
+        contrast_init_iter = 0
+        if self.cfg.LOSS.CONTRAST.ENABLE:
+            self.memory_bank = MemoryBank(
+                num_classes=self.real_classes,
+                memory_size = self.cfg.LOSS.CONTRAST.MEMORY_SIZE,
+                feature_dims = self.cfg.LOSS.CONTRAST.PROJ_DIM,
+                network_stride = self.network_stride,
+                pixel_update_freq=self.cfg.LOSS.CONTRAST.PIXEL_UPD_FREQ,
+                device = self.device,
+                ignore_index = self.cfg.LOSS.IGNORE_INDEX,
+            )
+            self.memory_bank.to(self.device)
+            # When to activate the contrastive loss
+            contrast_init_iter = self.cfg.LOSS.CONTRAST.MEMORY_SIZE
+            if self.cfg.TRAIN.LR_SCHEDULER.NAME == "warmupcosine":
+                contrast_init_iter += self.cfg.TRAIN.LR_SCHEDULER.WARMUP_COSINE_DECAY_EPOCHS
+        
         print("#####################")
         print("#  TRAIN THE MODEL  #")
         print("#####################")
@@ -782,7 +842,8 @@ class Base_Workflow(metaclass=ABCMeta):
         print(f"Start training in epoch {self.start_epoch+1} - Total: {self.cfg.TRAIN.EPOCHS}")
         start_time = time.time()
         self.val_best_metric = np.zeros(len(self.train_metric_names), dtype=np.float32)
-        self.val_best_loss = np.Inf
+        self.val_best_loss = np.inf
+        total_iters = 0
         for epoch in range(self.start_epoch, self.cfg.TRAIN.EPOCHS):
             print("~~~ Epoch {}/{} ~~~\n".format(epoch + 1, self.cfg.TRAIN.EPOCHS))
             e_start = time.time()
@@ -793,7 +854,7 @@ class Base_Workflow(metaclass=ABCMeta):
                 self.log_writer.set_step(epoch * self.num_training_steps_per_epoch)
 
             # Train
-            train_stats = train_one_epoch(
+            train_stats, iterations_done = train_one_epoch(
                 self.cfg,
                 model=self.model,
                 model_call_func=self.model_call_func,
@@ -807,7 +868,11 @@ class Base_Workflow(metaclass=ABCMeta):
                 log_writer=self.log_writer,
                 lr_scheduler=self.lr_scheduler,
                 verbose=self.cfg.TRAIN.VERBOSE,
+                memory_bank=self.memory_bank,
+                total_iters=total_iters,
+                contrast_warmup_iters=contrast_init_iter,
             )
+            total_iters += iterations_done
 
             # Save checkpoint
             if self.cfg.MODEL.SAVE_CKPT_FREQ != -1:
@@ -838,6 +903,7 @@ class Base_Workflow(metaclass=ABCMeta):
                     epoch=epoch,
                     data_loader=self.val_generator,
                     lr_scheduler=self.lr_scheduler,
+                    memory_bank=self.memory_bank,
                 )
 
                 # Save checkpoint is val loss improved
@@ -969,9 +1035,7 @@ class Base_Workflow(metaclass=ABCMeta):
         self.destroy_train_data()
 
     def load_test_data(self):
-        """
-        Load test data.
-        """
+        """Load test data."""
         print("######################")
         print("#   LOAD TEST DATA   #")
         print("######################")
@@ -1012,9 +1076,7 @@ class Base_Workflow(metaclass=ABCMeta):
             )
 
     def destroy_test_data(self):
-        """
-        Delete test variable to release memory.
-        """
+        """Delete test variable to release memory."""
         print("Releasing memory . . .")
         if "X_test" in locals() or "X_test" in globals():
             del self.X_test
@@ -1026,9 +1088,7 @@ class Base_Workflow(metaclass=ABCMeta):
             del self.current_sample
 
     def prepare_test_generators(self):
-        """
-        Prepare test data generator.
-        """
+        """Prepare test data generator."""
         if self.cfg.TEST.ENABLE:
             print("############################")
             print("#  PREPARE TEST GENERATOR  #")
@@ -1045,7 +1105,7 @@ class Base_Workflow(metaclass=ABCMeta):
 
     def apply_model_activations(self, pred: torch.Tensor, training=False) -> torch.Tensor:
         """
-        Function that apply the last activation (if any) to the model's output.
+        Apply the last activation (if any) to the model's output.
 
         Parameters
         ----------
@@ -1067,37 +1127,30 @@ class Base_Workflow(metaclass=ABCMeta):
         if self.cfg.MODEL.SOURCE == "bmz":
             return pred
 
-        if not isinstance(pred, list):
-            multiple_heads = False
-            pred = [pred]  # type: ignore
-        else:
-            multiple_heads = True
-            assert len(pred) == len(
-                self.activations
-            ), "Activations length need to match prediction list length in multiple heads setting"
-
-        for out_heads in range(len(pred)):
-            for key, value in self.activations[out_heads].items():
+        def __apply_acts(prediction, acts):
+            for key, value in acts.items():
                 # Ignore CE_Sigmoid as torch.nn.BCEWithLogitsLoss will apply Sigmoid automatically in a way
                 # that is more stable numerically (ref: https://pytorch.org/docs/stable/generated/torch.nn.BCEWithLogitsLoss.html)
                 if (training and value not in ["Linear", "CE_Sigmoid"]) or (not training and value != "Linear"):
                     value = "Sigmoid" if value == "CE_Sigmoid" else value
                     act = getattr(torch.nn, value)()
                     if key == ":":
-                        pred[out_heads] = act(pred[out_heads])
+                        prediction = act(prediction)
                     else:
-                        pred[out_heads][:, int(key), ...] = act(pred[out_heads][:, int(key), ...])
+                        prediction[:, int(key), ...] = act(prediction[:, int(key), ...])
+            return prediction
 
-        if not multiple_heads:
-            return pred[0]
+        if isinstance(pred, dict):
+            pred["pred"] = __apply_acts(pred["pred"], self.activations[0])
+            if "class" in pred:
+                pred["class"] = __apply_acts(pred["class"], self.activations[1])
         else:
-            return pred
+            pred = __apply_acts(pred, self.activations[0])
+        return pred
 
     @torch.no_grad()
     def test(self):
-        """
-        Test/Inference step.
-        """
+        """Test/Inference step."""
         self.load_test_data()
         if not self.model_prepared:
             self.prepare_model()
@@ -1275,12 +1328,15 @@ class Base_Workflow(metaclass=ABCMeta):
                     )
 
                 # Multi-head concatenation
-                if isinstance(p, list):
-                    p = torch.cat((p[0], torch.argmax(p[1], dim=1).unsqueeze(1)), dim=1)
+                if isinstance(p, dict):
+                    if "class" in p:
+                        p = torch.cat((p["pred"], torch.argmax(p["class"], dim=1).unsqueeze(1)), dim=1)
+                    else:
+                        p = p["pred"]
 
                 # Calculate the metrics
-                if y_batch is not None:
-                    metric_values = self.metric_calculation(output=p, targets=y_batch[k], train=False)
+                if y_batch is not None:                        
+                    metric_values = self.metric_calculation(output=p, targets=np.expand_dims(y_batch[k],0), train=False)
                     for metric in metric_values:
                         if str(metric).lower() not in self.stats[stats_name]:
                             self.stats[stats_name][str(metric).lower()] = 0
@@ -1302,11 +1358,11 @@ class Base_Workflow(metaclass=ABCMeta):
                 p = self.model_call_func(x_batch[k * self.cfg.TRAIN.BATCH_SIZE : top])
 
                 # Multi-head concatenation
-                if isinstance(p, list):
-                    p = torch.cat(
-                        (p[0], torch.argmax(p[1], dim=1).unsqueeze(1)),
-                        dim=1,
-                    )
+                if isinstance(p, dict):
+                    if "class" in p:
+                        p = torch.cat((p["pred"], torch.argmax(p["class"], dim=1).unsqueeze(1)), dim=1)
+                    else:
+                        p = p["pred"]
 
                 # Calculate the metrics
                 if y_batch is not None:
@@ -1352,7 +1408,9 @@ class Base_Workflow(metaclass=ABCMeta):
 
     def process_test_sample_by_chunks(self):
         """
-        Function to process a sample in the inference phase. A final H5/Zarr file is created in "TZCYX" or "TZYXC" order
+        Process a sample in the inference phase.
+        
+        A final H5/Zarr file is created in "TZCYX" or "TZYXC" order
         depending on ``DATA.TEST.INPUT_IMG_AXES_ORDER`` ('T' is always included).
         """
         if not self.cfg.TEST.REUSE_PREDICTIONS:
@@ -1470,8 +1528,9 @@ class Base_Workflow(metaclass=ABCMeta):
 
         def _prepare_bmz_sample(sample_key, img, apply_norm=True):
             """
-            Prepare a sample from the given ``img`` using the patch size in the configuration. It also saves
-            the sample in ``self.bmz_config`` using the ``sample_key``.
+            Prepare a sample from the given ``img`` using the patch size in the configuration.
+            
+            It also saves the sample in ``self.bmz_config`` using the ``sample_key``.
 
             Parameters
             ----------
@@ -1527,9 +1586,10 @@ class Base_Workflow(metaclass=ABCMeta):
         pred = self.model(torch.from_numpy(self.bmz_config["test_input_norm"]).to(self.device))
 
         # MAE
-        if isinstance(pred, tuple):
-            _, pred, mask = pred
+        if isinstance(pred, dict) and "mask" in pred:
             pred = self.apply_model_activations(pred)
+            mask = pred["mask"]
+            pred = pred["pred"]
             pred, _, _ = self.model_without_ddp.save_images(
                 torch.from_numpy(self.bmz_config["test_input_norm"]).to(self.device),
                 pred,
@@ -1540,8 +1600,11 @@ class Base_Workflow(metaclass=ABCMeta):
         else:
             pred = self.apply_model_activations(pred)
             # Multi-head concatenation
-            if isinstance(pred, list):
-                pred = torch.cat((pred[0], torch.argmax(pred[1], dim=1).unsqueeze(1)), dim=1)
+            if isinstance(pred, dict):
+                if "class" in pred:
+                    pred = torch.cat((pred["pred"], torch.argmax(pred["class"], dim=1).unsqueeze(1)), dim=1)
+                else:
+                    pred = pred["pred"]
 
         # Save output
         _prepare_bmz_sample("test_output", pred.clone().cpu().detach().numpy().astype(np.float32), apply_norm=False)
@@ -1555,9 +1618,7 @@ class Base_Workflow(metaclass=ABCMeta):
                     self.bmz_config["postprocessing"].append("sigmoid")
 
     def process_test_sample(self):
-        """
-        Function to process a sample in the inference phase.
-        """
+        """Process a sample in the inference phase."""
         # Skip processing image
         if "discard" in self.current_sample["X"] and self.current_sample["X"]["discard"]:
             return True
@@ -1727,8 +1788,8 @@ class Base_Workflow(metaclass=ABCMeta):
                     )
 
                 # Argmax if needed
-                if self.cfg.MODEL.N_CLASSES > 2 and self.cfg.DATA.TEST.ARGMAX_TO_OUTPUT and not self.multihead:
-                    _type = np.uint8 if self.cfg.MODEL.N_CLASSES < 255 else np.uint16
+                if self.cfg.DATA.N_CLASSES > 2 and self.cfg.DATA.TEST.ARGMAX_TO_OUTPUT and not self.multihead:
+                    _type = np.uint8 if self.cfg.DATA.N_CLASSES < 255 else np.uint16
                     pred = np.expand_dims(np.argmax(pred, -1), -1).astype(_type)
 
                 # Calculate the metrics
@@ -1769,7 +1830,8 @@ class Base_Workflow(metaclass=ABCMeta):
                     if self.post_processing["per_image"]
                     else self.cfg.PATHS.RESULT_DIR.PER_IMAGE
                 )
-                test_file = os.path.join(folder, self.current_sample["filename"])
+                # read file created by 'save_tif' (it always has .tif extension)
+                test_file = os.path.join(folder, os.path.splitext(self.current_sample["filename"])[0]+'.tif')
                 pred = read_img_as_ndarray(test_file, is_3d=self.cfg.PROBLEM.NDIM == "3D")
                 pred = np.expand_dims(pred, 0)  # expand dimensions to include "batch"
 
@@ -1816,9 +1878,13 @@ class Base_Workflow(metaclass=ABCMeta):
                 else:
                     pred = self.model_call_func(self.current_sample["X"])
 
-                # Multi-head concatenation
-                if isinstance(pred, list):
-                    pred = torch.cat((pred[0], torch.argmax(pred[1], dim=1).unsqueeze(1)), dim=1)
+                # Multi-head concatenationç
+                if isinstance(pred, dict):
+                    if "class" in pred:
+                        pred = torch.cat((pred["pred"], torch.argmax(pred["class"], dim=1).unsqueeze(1)), dim=1)
+                    else:
+                        pred = pred["pred"]
+
                 pred = to_numpy_format(pred, self.axes_order_back)
                 del self.current_sample["X"]
 
@@ -1836,8 +1902,8 @@ class Base_Workflow(metaclass=ABCMeta):
                 )
 
                 # Argmax if needed
-                if self.cfg.MODEL.N_CLASSES > 2 and self.cfg.DATA.TEST.ARGMAX_TO_OUTPUT and not self.multihead:
-                    _type = np.uint8 if self.cfg.MODEL.N_CLASSES < 255 else np.uint16
+                if self.cfg.DATA.N_CLASSES > 2 and self.cfg.DATA.TEST.ARGMAX_TO_OUTPUT and not self.multihead:
+                    _type = np.uint8 if self.cfg.DATA.N_CLASSES < 255 else np.uint16
                     pred = np.expand_dims(np.argmax(pred, -1), -1).astype(_type)
 
                 if self.cfg.TEST.POST_PROCESSING.APPLY_MASK:
@@ -1845,7 +1911,8 @@ class Base_Workflow(metaclass=ABCMeta):
 
             else:
                 # load prediction from file
-                test_file = os.path.join(self.cfg.PATHS.RESULT_DIR.FULL_IMAGE, self.current_sample["filename"])
+                # read file created by 'save_tif' (it always has .tif extension)
+                test_file = os.path.join(self.cfg.PATHS.RESULT_DIR.FULL_IMAGE, os.path.splitext(self.current_sample["filename"])[0]+'.tif')
                 pred = read_img_as_ndarray(test_file, is_3d=self.cfg.PROBLEM.NDIM == "3D")
                 pred = np.expand_dims(pred, 0)  # expand dimensions to include "batch"
 
@@ -1998,6 +2065,7 @@ class Base_Workflow(metaclass=ABCMeta):
     def after_full_image(self, pred: NDArray):
         """
         Place here any code that must be executed after generating the prediction by supplying the entire image to the model.
+        
         To enable this, the model should be convolutional, and the image(s) should be in a 2D format. Using 3D images as
         direct inputs to the model is not feasible due to their large size.
 
@@ -2009,9 +2077,7 @@ class Base_Workflow(metaclass=ABCMeta):
         raise NotImplementedError
 
     def after_all_images(self):
-        """
-        Place here any code that must be done after predicting all images.
-        """
+        """Place here any code that must be done after predicting all images."""
         ############################
         ### POST-PROCESSING (2D) ###
         ############################
@@ -2047,7 +2113,5 @@ class Base_Workflow(metaclass=ABCMeta):
             )
 
     def after_all_patch_prediction_by_chunks(self):
-        """
-        Place any code that needs to be done after predicting all the patches, one by one, in the "by chunks" setting.
-        """
+        """Place any code that needs to be done after predicting all the patches, one by one, in the "by chunks" setting."""
         raise NotImplementedError

@@ -1,3 +1,12 @@
+"""
+Configuration management for BiaPy.
+
+This module defines the Config class, which encapsulates all configuration options
+for BiaPy workflows using a YACS CfgNode. It provides default values and hierarchical
+organization for system, data, augmentation, model, loss, training, inference,
+post-processing, and logging parameters. Utility functions are included for updating
+dependent configuration variables after merging user-provided configs.
+"""
 import os
 from yacs.config import CfgNode as CN
 import copy
@@ -6,8 +15,31 @@ from typing import (
 )
 
 class Config:
-    def __init__(self, job_dir: str, job_identifier: str):
+    """
+    BiaPy configuration handler.
 
+    This class manages the hierarchical configuration for BiaPy experiments,
+    including system resources, problem specification, data loading, augmentation,
+    model architecture, loss functions, training, inference, post-processing, and
+    logging. It uses YACS CfgNode for flexible and robust configuration management.
+
+    Attributes
+    ----------
+    _C : CN
+        The root YACS configuration node containing all experiment parameters.
+    """
+
+    def __init__(self, job_dir: str, job_identifier: str):
+        """
+        Initialize the Config object with default values.
+
+        Parameters
+        ----------
+        job_dir : str
+            Directory where job outputs (results, checkpoints, logs) will be stored.
+        job_identifier : str
+            Unique identifier for the job (used in output paths).
+        """
         if "/" in job_identifier:
             raise ValueError("Job name can not contain / character. Provided: {}".format(job_identifier))
 
@@ -50,7 +82,7 @@ class Config:
 
         ### SEMANTIC_SEG
         _C.PROBLEM.SEMANTIC_SEG = CN()
-        # Class id to ignore when MODEL.N_CLASSES > 2
+        # Class id to ignore when DATA.N_CLASSES > 2
         _C.PROBLEM.SEMANTIC_SEG.IGNORE_CLASS_ID = 0
 
         ### INSTANCE_SEG
@@ -283,7 +315,7 @@ class Config:
         # Lower and upper bound for percentile clip. Must be set when DATA.NORMALIZATION.PERC_CLIP.ENABLE = 'True'
         _C.DATA.NORMALIZATION.PERC_CLIP.LOWER_PERC = -1.0
         _C.DATA.NORMALIZATION.PERC_CLIP.UPPER_PERC = -1.0
-        # Lower and upper values to clip. If these are provided the percentiles are not calculated with the variable above, e.g.
+        # Lower and upper values to clip. If these are provided the percentiles are not calculated based on 
         # 'DATA.NORMALIZATION.PERC_CLIP.LOWER_PERC' and 'DATA.NORMALIZATION.PERC_CLIP.UPPER_PERC' 
         _C.DATA.NORMALIZATION.PERC_CLIP.LOWER_VALUE = -1.0
         _C.DATA.NORMALIZATION.PERC_CLIP.UPPER_VALUE = -1.0
@@ -1025,7 +1057,7 @@ class Config:
         # Activation function to use along the model
         _C.MODEL.ACTIVATION = "ELU"
         # Number of classes including the background class (that should be using 0 label)
-        _C.MODEL.N_CLASSES = 2
+        _C.DATA.N_CLASSES = 2
         # Downsampling to be made in Z. This value will be the third integer of the MaxPooling operation. When facing
         # anysotropic datasets set it to get better performance
         _C.MODEL.Z_DOWN = [0, 0, 0, 0]
@@ -1112,6 +1144,135 @@ class Config:
         # Whether to maintain or not the upscaling layer. 
         _C.MODEL.RCAN_UPSCALING_LAYER = True
 
+        _C.MODEL.HRNET_64 = CN()
+        _C.MODEL.HRNET_64.Z_DOWN = True
+        _C.MODEL.HRNET_64.STAGE2 = CN()
+        _C.MODEL.HRNET_64.STAGE2.NUM_MODULES = 1
+        _C.MODEL.HRNET_64.STAGE2.NUM_BRANCHES = 2
+        _C.MODEL.HRNET_64.STAGE2.NUM_BLOCKS = [4, 4]
+        _C.MODEL.HRNET_64.STAGE2.NUM_CHANNELS = [64, 128]
+        _C.MODEL.HRNET_64.STAGE2.BLOCK = 'BASIC'
+
+        _C.MODEL.HRNET_64.STAGE3 = CN()
+        _C.MODEL.HRNET_64.STAGE3.NUM_MODULES = 4
+        _C.MODEL.HRNET_64.STAGE3.NUM_BRANCHES = 3
+        _C.MODEL.HRNET_64.STAGE3.NUM_BLOCKS = [4, 4, 4]
+        _C.MODEL.HRNET_64.STAGE3.NUM_CHANNELS = [64, 128, 256]
+        _C.MODEL.HRNET_64.STAGE3.BLOCK = 'BASIC'
+
+        _C.MODEL.HRNET_64.STAGE4 = CN()
+        _C.MODEL.HRNET_64.STAGE4.NUM_MODULES = 3
+        _C.MODEL.HRNET_64.STAGE4.NUM_BRANCHES = 4
+        _C.MODEL.HRNET_64.STAGE4.NUM_BLOCKS = [4, 4, 4, 4]
+        _C.MODEL.HRNET_64.STAGE4.NUM_CHANNELS = [64, 128, 256, 512]
+        _C.MODEL.HRNET_64.STAGE4.BLOCK = 'BASIC'
+
+
+        # configs for HRNet48
+        _C.MODEL.HRNET_48 = CN()
+        _C.MODEL.HRNET_48.Z_DOWN = True
+        _C.MODEL.HRNET_48.STAGE2 = CN()
+        _C.MODEL.HRNET_48.STAGE2.NUM_MODULES = 1
+        _C.MODEL.HRNET_48.STAGE2.NUM_BRANCHES = 2
+        _C.MODEL.HRNET_48.STAGE2.NUM_BLOCKS = [4, 4]
+        _C.MODEL.HRNET_48.STAGE2.NUM_CHANNELS = [48, 96]
+        _C.MODEL.HRNET_48.STAGE2.BLOCK = 'BASIC'
+
+        _C.MODEL.HRNET_48.STAGE3 = CN()
+        _C.MODEL.HRNET_48.STAGE3.NUM_MODULES = 4
+        _C.MODEL.HRNET_48.STAGE3.NUM_BRANCHES = 3
+        _C.MODEL.HRNET_48.STAGE3.NUM_BLOCKS = [4, 4, 4]
+        _C.MODEL.HRNET_48.STAGE3.NUM_CHANNELS = [48, 96, 192]
+        _C.MODEL.HRNET_48.STAGE3.BLOCK = 'BASIC'
+
+        _C.MODEL.HRNET_48.STAGE4 = CN()
+        _C.MODEL.HRNET_48.STAGE4.NUM_MODULES = 3
+        _C.MODEL.HRNET_48.STAGE4.NUM_BRANCHES = 4
+        _C.MODEL.HRNET_48.STAGE4.NUM_BLOCKS = [4, 4, 4, 4]
+        _C.MODEL.HRNET_48.STAGE4.NUM_CHANNELS = [48, 96, 192, 384]
+        _C.MODEL.HRNET_48.STAGE4.BLOCK = 'BASIC'
+
+
+        # configs for HRNet32
+        _C.MODEL.HRNET_32 = CN()
+        _C.MODEL.HRNET_32.Z_DOWN = True
+        _C.MODEL.HRNET_32.STAGE2 = CN()
+        _C.MODEL.HRNET_32.STAGE2.NUM_MODULES = 1
+        _C.MODEL.HRNET_32.STAGE2.NUM_BRANCHES = 2
+        _C.MODEL.HRNET_32.STAGE2.NUM_BLOCKS = [4, 4]
+        _C.MODEL.HRNET_32.STAGE2.NUM_CHANNELS = [32, 64]
+        _C.MODEL.HRNET_32.STAGE2.BLOCK = 'BASIC'
+
+        _C.MODEL.HRNET_32.STAGE3 = CN()
+        _C.MODEL.HRNET_32.STAGE3.NUM_MODULES = 4
+        _C.MODEL.HRNET_32.STAGE3.NUM_BRANCHES = 3
+        _C.MODEL.HRNET_32.STAGE3.NUM_BLOCKS = [4, 4, 4]
+        _C.MODEL.HRNET_32.STAGE3.NUM_CHANNELS = [32, 64, 128]
+        _C.MODEL.HRNET_32.STAGE3.BLOCK = 'BASIC'
+
+        _C.MODEL.HRNET_32.STAGE4 = CN()
+        _C.MODEL.HRNET_32.STAGE4.NUM_MODULES = 3
+        _C.MODEL.HRNET_32.STAGE4.NUM_BRANCHES = 4
+        _C.MODEL.HRNET_32.STAGE4.NUM_BLOCKS = [4, 4, 4, 4]
+        _C.MODEL.HRNET_32.STAGE4.NUM_CHANNELS = [32, 64, 128, 256]
+        _C.MODEL.HRNET_32.STAGE4.BLOCK = 'BASIC'
+
+
+        # configs for HRNet18
+        _C.MODEL.HRNET_18 = CN()
+        _C.MODEL.HRNET_18.Z_DOWN = True
+        _C.MODEL.HRNET_18.STAGE2 = CN()
+        _C.MODEL.HRNET_18.STAGE2.NUM_MODULES = 1
+        _C.MODEL.HRNET_18.STAGE2.NUM_BRANCHES = 2
+        _C.MODEL.HRNET_18.STAGE2.NUM_BLOCKS = [4, 4]
+        _C.MODEL.HRNET_18.STAGE2.NUM_CHANNELS = [18, 36]
+        _C.MODEL.HRNET_18.STAGE2.BLOCK = 'BASIC'
+
+        _C.MODEL.HRNET_18.STAGE3 = CN()
+        _C.MODEL.HRNET_18.STAGE3.NUM_MODULES = 4
+        _C.MODEL.HRNET_18.STAGE3.NUM_BRANCHES = 3
+        _C.MODEL.HRNET_18.STAGE3.NUM_BLOCKS = [4, 4, 4]
+        _C.MODEL.HRNET_18.STAGE3.NUM_CHANNELS = [18, 36, 72]
+        _C.MODEL.HRNET_18.STAGE3.BLOCK = 'BASIC'
+
+        _C.MODEL.HRNET_18.STAGE4 = CN()
+        _C.MODEL.HRNET_18.STAGE4.NUM_MODULES = 3
+        _C.MODEL.HRNET_18.STAGE4.NUM_BRANCHES = 4
+        _C.MODEL.HRNET_18.STAGE4.NUM_BLOCKS = [4, 4, 4, 4]
+        _C.MODEL.HRNET_18.STAGE4.NUM_CHANNELS = [18, 36, 72, 144]
+        _C.MODEL.HRNET_18.STAGE4.BLOCK = 'BASIC'
+
+        # configs for HRNet2x20
+        _C.MODEL.HRNET2X_20 = CN()
+        _C.MODEL.HRNET2X_20.Z_DOWN = True
+        _C.MODEL.HRNET2X_20.STAGE1 = CN()
+        _C.MODEL.HRNET2X_20.STAGE1.NUM_MODULES = 1
+        _C.MODEL.HRNET2X_20.STAGE1.NUM_BRANCHES = 2
+        _C.MODEL.HRNET2X_20.STAGE1.NUM_BLOCKS = [4, 4]
+        _C.MODEL.HRNET2X_20.STAGE1.NUM_CHANNELS = [32, 64]
+        _C.MODEL.HRNET2X_20.STAGE1.BLOCK = 'BOTTLENECK'
+
+        _C.MODEL.HRNET2X_20.STAGE2 = CN()
+        _C.MODEL.HRNET2X_20.STAGE2.NUM_MODULES = 1
+        _C.MODEL.HRNET2X_20.STAGE2.NUM_BRANCHES = 3
+        _C.MODEL.HRNET2X_20.STAGE2.NUM_BLOCKS = [4, 4, 4]
+        _C.MODEL.HRNET2X_20.STAGE2.NUM_CHANNELS = [20, 40, 80]
+        _C.MODEL.HRNET2X_20.STAGE2.BLOCK = 'BASIC'
+
+        _C.MODEL.HRNET2X_20.STAGE3 = CN()
+        _C.MODEL.HRNET2X_20.STAGE3.NUM_MODULES = 4
+        _C.MODEL.HRNET2X_20.STAGE3.NUM_BRANCHES = 4
+        _C.MODEL.HRNET2X_20.STAGE3.NUM_BLOCKS = [4, 4, 4, 4]
+        _C.MODEL.HRNET2X_20.STAGE3.NUM_CHANNELS = [20, 40, 80, 160]
+        _C.MODEL.HRNET2X_20.STAGE3.BLOCK = 'BASIC'
+
+        _C.MODEL.HRNET2X_20.STAGE4 = CN()
+        _C.MODEL.HRNET2X_20.STAGE4.NUM_MODULES = 3
+        _C.MODEL.HRNET2X_20.STAGE4.NUM_BRANCHES = 5
+        _C.MODEL.HRNET2X_20.STAGE4.NUM_BLOCKS = [4, 4, 4, 4, 4]
+        _C.MODEL.HRNET2X_20.STAGE4.NUM_CHANNELS = [20, 40, 80, 160, 320]
+        _C.MODEL.HRNET2X_20.STAGE4.BLOCK = 'BASIC'
+
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Loss
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1158,12 +1319,15 @@ class Config:
         # To adjust the loss function based on the imbalance between classes. Used when LOSS.TYPE == "CE" in detection and
         # semantic segmentation and if using B,C,M,P or A channels in instance segmentation workflow.
         _C.LOSS.CLASS_REBALANCE = False
-        # Whether to ignore a value in the loss and metric calculation. This functionality is still experimental as it is only added in instance segmentation workflow and
-        # for a few channel configurations.
-        _C.LOSS.IGNORE_VALUES = False
-        # Value to ignore when 'LOSS.IGNORE_VALUES' is True
-        _C.LOSS.VALUE_TO_IGNORE = -1
-
+        # Whether to ignore a value in the loss and metric calculation. This is only available when LOSS.TYPE == "CE". This value will not only
+        # be ignored in the loss computation but in the metrics, e.g. IoU.
+        _C.LOSS.IGNORE_INDEX = -1
+        _C.LOSS.CONTRAST = CN()
+        _C.LOSS.CONTRAST.ENABLE = False
+        _C.LOSS.CONTRAST.MEMORY_SIZE = 5000
+        _C.LOSS.CONTRAST.PROJ_DIM = 256
+        _C.LOSS.CONTRAST.PIXEL_UPD_FREQ = 10
+        
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Training phase
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1305,7 +1469,7 @@ class Config:
         # the process is repeated with each of the threshold values
         _C.TEST.MATCHING_STATS_THS = [0.3, 0.5, 0.75]
         # Decide in which thresholds to create a colored image of the TPs, FNs and FPs
-        _C.TEST.MATCHING_STATS_THS_COLORED_IMG = [0.3]
+        _C.TEST.MATCHING_STATS_THS_COLORED_IMG = []
 
         ### Detection
         # To decide which function is going to be used to create point from probabilities. Options: ['peak_local_max', 'blob_log']
@@ -1390,10 +1554,7 @@ class Config:
         #     (Lehmann et al., 201211 ; https://doi.org/10.1093/bioinformatics/btw413).
         #
         #   * 'elongation' is the inverse of the circularity. The values of elongation range from 1 for round particles and increase for
-        #     elongated particles. Calculated as: 
-        #       - In 2D: (perimeter^2)/(4 * PI * area) 
-        #       - In 3D: (sqrt(surface area^3))/ (6 * volume * sqrt(PI)) where 'sqrt' is the square root. For the 3D diplib library is used
-        #         where it corresponds to 'P2A' metric (more info here: https://diplib.org/diplib-docs/features.html#shape_features_P2A)
+        #     elongated particles. Calculated as: (perimeter^2)/(4 * PI * area) . It is only measurable for 2D images.
         #
         #   * 'npixels' corresponds to the sum of pixels that compose an instance.
         #
@@ -1555,26 +1716,74 @@ class Config:
         self._C = _C
 
     def get_cfg_defaults(self) -> CN:
-        """Get a yacs CfgNode object with default values for my_project."""
+        """
+        Get a clone of the default configuration.
+
+        Returns
+        -------
+        CN
+            A cloned YACS CfgNode object with default values.
+        """
         # Return a clone so that the defaults will not be altered
         # This is for the "local variable" use pattern
         return self._C.clone()
 
     def to_dict(self):
+        """
+        Convert the configuration to a Python dictionary.
+
+        Returns
+        -------
+        dict
+            Dictionary representation of the configuration.
+        """
         return dict(self._C)
 
     def copy(self):
+        """
+        Create a deep copy of the Config object.
+
+        Returns
+        -------
+        Config
+            A deep copy of the current Config instance.
+        """
         return copy.deepcopy(self)
 
     def __str__(self):
+        """
+        Return a string representation of the Config object.
+
+        Returns
+        -------
+        str
+            String representation of the configuration.
+        """
         return str(self.__dict__)
 
     def __repr__(self):
+        """
+        Return a string representation of the Config object.
+
+        Returns
+        -------
+        str
+            String representation of the configuration.
+        """
         return str(self.__dict__)
 
 def update_dependencies(cfg) -> None:
-    """Update some variables that depend of changes made after merge the .cfg file provide by the user. That is,
-    this function should be called after YACS's merge_from_file().
+    """
+    Update dependent configuration variables after merging user config.
+
+    This function should be called after merging a user-provided .cfg file
+    to ensure that all dependent paths and variables are updated accordingly.
+    That is, this function should be called after YACS's merge_from_file().
+
+    Parameters
+    ----------
+    cfg : Config or CN
+        The configuration object to update.
     """
     call = getattr(cfg, "_C") if bool(getattr(cfg, "_C", False)) else cfg
     # Remove possible / characters at the end of the paths

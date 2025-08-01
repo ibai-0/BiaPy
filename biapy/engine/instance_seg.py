@@ -1,3 +1,11 @@
+"""
+Instance segmentation workflow for BiaPy.
+
+This module defines the Instance_Segmentation_Workflow class, which implements the
+training, validation, and inference pipeline for instance segmentation tasks in BiaPy.
+It handles data preparation, model setup, metrics, predictions, post-processing,
+and result saving for assigning unique IDs to each object in 2D and 3D images.
+"""
 import os
 import torch
 import h5py
@@ -31,6 +39,7 @@ from biapy.engine.metrics import (
     instance_segmentation_loss,
     multiple_metrics,
     detection_metrics,
+    ContrastCELoss,
 )
 from biapy.engine.base_workflow import Base_Workflow
 from biapy.utils.misc import (
@@ -49,6 +58,7 @@ from biapy.data.dataset import PatchCoords
 class Instance_Segmentation_Workflow(Base_Workflow):
     """
     Instance segmentation workflow where the goal is to assign an unique id, i.e. integer, to each object of the input image.
+    
     More details in `our documentation <https://biapy.readthedocs.io/en/latest/workflows/instance_segmentation.html>`_.
 
     Parameters
@@ -67,6 +77,25 @@ class Instance_Segmentation_Workflow(Base_Workflow):
     """
 
     def __init__(self, cfg, job_identifier, device, args, **kwargs):
+        """
+        Initialize the Instance_Segmentation_Workflow.
+
+        Sets up configuration, device, job identifier, and initializes
+        workflow-specific attributes for instance segmentation tasks.
+
+        Parameters
+        ----------
+        cfg : YACS configuration
+            Running configuration.
+        job_identifier : str
+            Complete name of the running job.
+        device : torch.device
+            Device used.
+        args : argparse.Namespace
+            Arguments used in BiaPy's call.
+        **kwargs : dict
+            Additional keyword arguments.
+        """
         super(Instance_Segmentation_Workflow, self).__init__(cfg, job_identifier, device, args, **kwargs)
 
         self.original_train_input_mask_axes_order = self.cfg.DATA.TRAIN.INPUT_MASK_AXES_ORDER
@@ -150,6 +179,8 @@ class Instance_Segmentation_Workflow(Base_Workflow):
 
     def define_activations_and_channels(self):
         """
+        Define the activations and output channels of the model.
+
         This function must define the following variables:
 
         self.model_output_channels : List of functions
@@ -206,19 +237,23 @@ class Instance_Segmentation_Workflow(Base_Workflow):
             raise ValueError("Something wrong happen during instance seg. channel configuration. Contact BiaPy team")
 
         # Multi-head: instances + classification
-        if self.cfg.MODEL.N_CLASSES > 2:
+        if self.cfg.DATA.N_CLASSES > 2:
             self.activations = [self.activations, {"0": "Linear"}]
-            self.model_output_channels["channels"] = [self.model_output_channels["channels"], self.cfg.MODEL.N_CLASSES]
+            self.model_output_channels["channels"] = [self.model_output_channels["channels"], self.cfg.DATA.N_CLASSES]
             self.multihead = True
         else:
             self.activations = [self.activations]
             self.model_output_channels["channels"] = [self.model_output_channels["channels"]]
             self.multihead = False
 
+        self.real_classes = self.model_output_channels["channels"][0] + 1
+
         super().define_activations_and_channels()
 
     def define_metrics(self):
         """
+        Define the metrics to be used in the instance segmentation workflow.
+
         This function must define the following variables:
 
         self.train_metrics : List of functions
@@ -299,7 +334,12 @@ class Instance_Segmentation_Workflow(Base_Workflow):
                 self.train_metric_names.append("IoU (classes)")
                 self.train_metric_best += ["max"]
                 # Used to calculate IoU with the classification results
-                self.jaccard_index_matching = jaccard_index(device=self.device, num_classes=self.cfg.MODEL.N_CLASSES)
+                self.jaccard_index_matching = jaccard_index(
+                    device=self.device, 
+                    num_classes=self.cfg.DATA.N_CLASSES,
+                    ndim=self.dims,
+                    ignore_index=self.cfg.LOSS.IGNORE_INDEX,
+                )
         else:  # synapses
             if self.cfg.PROBLEM.INSTANCE_SEG.DATA_CHANNELS == "BF":
                 self.train_metric_names = ["IoU (B channel)"]
@@ -320,11 +360,12 @@ class Instance_Segmentation_Workflow(Base_Workflow):
 
         self.train_metrics.append(
             multiple_metrics(
-                num_classes=self.cfg.MODEL.N_CLASSES,
+                num_classes=self.cfg.DATA.N_CLASSES,
                 metric_names=self.train_metric_names,
                 device=self.device,
                 model_source=self.cfg.MODEL.SOURCE,
-                val_to_ignore=None if not self.cfg.LOSS.IGNORE_VALUES else self.cfg.LOSS.VALUE_TO_IGNORE,
+                ignore_index=self.cfg.LOSS.IGNORE_INDEX,
+                ndim=self.dims,
             )
         )
 
@@ -384,14 +425,21 @@ class Instance_Segmentation_Workflow(Base_Workflow):
         if self.multihead:
             self.test_metric_names.append("IoU (classes)")
             # Used to calculate IoU with the classification results
-            self.jaccard_index_matching = jaccard_index(device="cpu", num_classes=self.cfg.MODEL.N_CLASSES)
+            self.jaccard_index_matching = jaccard_index(
+                device=self.device, 
+                num_classes=self.cfg.DATA.N_CLASSES,
+                ndim=self.dims,
+                ignore_index=self.cfg.LOSS.IGNORE_INDEX,
+            )
 
         self.test_metrics.append(
             multiple_metrics(
-                num_classes=self.cfg.MODEL.N_CLASSES,
+                num_classes=self.cfg.DATA.N_CLASSES,
                 metric_names=self.test_metric_names,
                 device=self.device,
                 model_source=self.cfg.MODEL.SOURCE,
+                ndim=self.dims,
+                ignore_index=self.cfg.LOSS.IGNORE_INDEX,
             )
         )
         
@@ -400,15 +448,24 @@ class Instance_Segmentation_Workflow(Base_Workflow):
             self.test_extra_metrics += ["Precision (post-points)", "Recall (post-points)", "F1 (post-points)", "TP (post-points)", "FP (post-points)", "FN (post-points)"]
             self.test_metric_names += self.test_extra_metrics
 
-        self.loss = instance_segmentation_loss(
+        instance_loss = instance_segmentation_loss(
             self.cfg.PROBLEM.INSTANCE_SEG.DATA_CHANNEL_WEIGHTS,
             self.cfg.PROBLEM.INSTANCE_SEG.DATA_CHANNELS,
             self.cfg.PROBLEM.INSTANCE_SEG.DISTANCE_CHANNEL_MASK,
-            self.cfg.MODEL.N_CLASSES,
+            self.cfg.DATA.N_CLASSES,
             class_rebalance=self.cfg.LOSS.CLASS_REBALANCE,
             instance_type=self.cfg.PROBLEM.INSTANCE_SEG.TYPE,
-            val_to_ignore = None if not self.cfg.LOSS.IGNORE_VALUES else self.cfg.LOSS.VALUE_TO_IGNORE
+            ignore_index = self.cfg.LOSS.IGNORE_INDEX
         )
+        
+        if self.cfg.LOSS.CONTRAST.ENABLE: 
+            self.loss = ContrastCELoss(
+                main_loss=instance_loss, # type: ignore
+                ndim=self.dims,
+                ignore_index=self.cfg.LOSS.IGNORE_INDEX,
+            )
+        else:
+            self.loss = instance_loss
 
         super().define_metrics()
 
@@ -420,7 +477,7 @@ class Instance_Segmentation_Workflow(Base_Workflow):
         metric_logger: Optional[MetricLogger] = None,
     ) -> Dict:
         """
-        Execution of the metrics defined in :func:`~define_metrics` function.
+        Calculate the metrics defined in :func:`~define_metrics` function.
 
         Parameters
         ----------
@@ -441,7 +498,6 @@ class Instance_Segmentation_Workflow(Base_Workflow):
         out_metrics : dict
             Value of the metrics for the given prediction.
         """
-
         if isinstance(output, np.ndarray):
             _output = to_pytorch_format(
                 output.copy(),
@@ -492,7 +548,9 @@ class Instance_Segmentation_Workflow(Base_Workflow):
 
     def instance_seg_process(self, pred, filenames, out_dir, out_dir_post_proc, calculate_metrics: bool = True):
         """
-        Instance segmentation workflow engine for test/inference. Process model's prediction to prepare
+        Instance segmentation workflow engine for test/inference.
+        
+        Process model's prediction to prepare
         instance segmentation output and calculate metrics.
 
         Parameters
@@ -650,7 +708,7 @@ class Instance_Segmentation_Workflow(Base_Workflow):
                     error_shape = (40, 256, 256, 2)
                 if error_shape:
                     raise ValueError(
-                        f"Image {test_file} wrong dimension. In instance segmentation, when 'MODEL.N_CLASSES' are "
+                        f"Image {test_file} wrong dimension. In instance segmentation, when 'DATA.N_CLASSES' are "
                         f"more than 2 labels need to have two channels, e.g. {error_shape}, containing the instance "
                         "segmentation map (first channel) and classification map (second channel)."
                     )
@@ -661,8 +719,8 @@ class Instance_Segmentation_Workflow(Base_Workflow):
 
                 # Measure class IoU
                 class_iou = self.jaccard_index_matching(
-                    torch.as_tensor(class_channel.squeeze().astype(np.int32)),
-                    torch.as_tensor(_Y_classes.squeeze().astype(np.int32)),
+                    torch.as_tensor(class_channel.squeeze().astype(np.int32)).to(self.device, non_blocking=True),
+                    torch.as_tensor(_Y_classes.squeeze().astype(np.int32)).to(self.device, non_blocking=True),
                 )
                 class_iou = class_iou.item() if not torch.isnan(class_iou) else 0
                 print(f"Class IoU: {class_iou}")
@@ -673,7 +731,7 @@ class Instance_Segmentation_Workflow(Base_Workflow):
 
             # For torchvision models that resize need to rezise the images
             if w_pred.shape != _Y.shape:
-                _Y = resize(_Y, w_pred.shape, order=0)
+                w_pred = resize(w_pred, _Y.shape, order=0)
 
             # Convert instances to integer
             if _Y.dtype == np.float32:
@@ -853,7 +911,6 @@ class Instance_Segmentation_Workflow(Base_Workflow):
                         d_result["sphericities"],
                         d_result["diameters"],
                         d_result["perimeters"],
-                        d_result["elongations"],
                         d_result["comment"],
                         d_result["conditions"],
                     ),
@@ -867,7 +924,6 @@ class Instance_Segmentation_Workflow(Base_Workflow):
                         "sphericity",
                         "diameter",
                         "perimeter (surface area)",
-                        "elongation (P2A)",
                         "comment",
                         "conditions",
                     ],
@@ -1041,7 +1097,9 @@ class Instance_Segmentation_Workflow(Base_Workflow):
         calculate_metrics: bool = False,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
-        Synapse segmentation workflow engine for test/inference. Process model's prediction to prepare
+        Synapse segmentation workflow engine for test/inference.
+        
+        Process model's prediction to prepare
         synapse segmentation output and calculate metrics.
 
         Parameters
@@ -1409,9 +1467,7 @@ class Instance_Segmentation_Workflow(Base_Workflow):
         return pre_points_df, post_points_df
 
     def process_test_sample(self):
-        """
-        Function to process a sample in the inference phase.
-        """
+        """Process a sample in the inference phase."""
         if self.cfg.MODEL.SOURCE != "torchvision":
             self.instances_already_created = False
             super().process_test_sample()
@@ -1454,7 +1510,7 @@ class Instance_Segmentation_Workflow(Base_Workflow):
 
     def after_merge_patches(self, pred):
         """
-        Steps need to be done after merging all predicted patches into the original image.
+        Execute steps needed after merging all predicted patches into the original image.
 
         Parameters
         ----------
@@ -1588,9 +1644,7 @@ class Instance_Segmentation_Workflow(Base_Workflow):
                     )
 
     def after_all_patch_prediction_by_chunks(self):
-        """
-        Place any code that needs to be done after predicting all the patches, one by one, in the "by chunks" setting.
-        """
+        """Execute steps needed after merging all predicted patches into the original image in "by chunks" setting."""
         assert isinstance(self.all_pred, list) and isinstance(self.all_gt, list)
         if self.cfg.PROBLEM.INSTANCE_SEG.TYPE == "regular":
             if self.cfg.TEST.BY_CHUNKS.WORKFLOW_PROCESS.TYPE == "chunk_by_chunk":
@@ -2266,7 +2320,7 @@ class Instance_Segmentation_Workflow(Base_Workflow):
 
     def after_full_image(self, pred: NDArray):
         """
-        Steps that must be executed after generating the prediction by supplying the entire image to the model.
+        Execute steps needed after generating the prediction by supplying the entire image to the model.
 
         Parameters
         ----------
@@ -2303,9 +2357,7 @@ class Instance_Segmentation_Workflow(Base_Workflow):
             raise NotImplementedError
 
     def after_all_images(self):
-        """
-        Steps that must be done after predicting all images.
-        """
+        """Execute steps needed after predicting all images."""
         super().after_all_images()
         assert isinstance(self.all_pred, list) and isinstance(self.all_gt, list)
         if self.cfg.TEST.ANALIZE_2D_IMGS_AS_3D_STACK:
@@ -2485,7 +2537,8 @@ class Instance_Segmentation_Workflow(Base_Workflow):
 
     def prepare_instance_data(self):
         """
-        Creates instance segmentation ground truth images to train the model based on the ground truth instances provided.
+        Create instance segmentation ground truth images to train the model based on the ground truth instances provided.
+
         They will be saved in a separate folder in the root path of the ground truth.
         """
         original_test_path, original_test_mask_path = None, None

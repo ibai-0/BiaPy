@@ -1,4 +1,4 @@
-# BiaPy version: 3.5.13
+# BiaPy version: 3.6.3
 
 SYSTEM:
     NUM_CPUS: -1
@@ -11,6 +11,8 @@ PROBLEM:
   
 DATA: 
     PATCH_SIZE: (6, 128, 128, 1)
+    NORMALIZATION:
+        TYPE: "div"
     TRAIN:                                                                                                              
         PATH: /path/to/data
         GT_PATH: /path/to/data

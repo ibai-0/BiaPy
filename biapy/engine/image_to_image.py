@@ -1,3 +1,11 @@
+"""
+Image-to-image workflow for BiaPy.
+
+This module defines the Image_to_Image_Workflow class, which implements the
+training, validation, and inference pipeline for image-to-image regression tasks
+in BiaPy. It supports metrics such as PSNR, SSIM, FID, IS, LPIPS, and handles
+data loading, model setup, predictions, and result saving for 2D and 3D images.
+"""
 import torch
 import numpy as np
 from torchmetrics.regression import MeanSquaredError, MeanAbsoluteError
@@ -9,7 +17,7 @@ from typing import Dict, Optional
 from numpy.typing import NDArray
 
 
-from biapy.engine.metrics import SSIM_loss, W_MAE_SSIM_loss, W_MSE_SSIM_loss
+from biapy.engine.metrics import SSIM_loss, W_MAE_SSIM_loss, W_MSE_SSIM_loss, loss_encapsulation
 from biapy.engine.base_workflow import Base_Workflow
 from biapy.utils.misc import to_pytorch_format, MetricLogger
 from biapy.data.data_2D_manipulation import (
@@ -21,7 +29,6 @@ from biapy.data.data_3D_manipulation import (
     merge_3D_data_with_overlap,
 )
 from biapy.data.data_manipulation import save_tif
-from biapy.data.dataset import PatchCoords
 
 
 class Image_to_Image_Workflow(Base_Workflow):
@@ -44,6 +51,25 @@ class Image_to_Image_Workflow(Base_Workflow):
     """
 
     def __init__(self, cfg, job_identifier, device, args, **kwargs):
+        """
+        Initialize the Image_to_Image_Workflow.
+
+        Sets up configuration, device, job identifier, and initializes
+        workflow-specific attributes for image-to-image tasks.
+
+        Parameters
+        ----------
+        cfg : YACS configuration
+            Running configuration.
+        job_identifier : str
+            Complete name of the running job.
+        device : torch.device
+            Device used.
+        args : argparse.Namespace
+            Arguments used in BiaPy's call.
+        **kwargs : dict
+            Additional keyword arguments.
+        """
         super(Image_to_Image_Workflow, self).__init__(cfg, job_identifier, device, args, **kwargs)
         # From now on, no modification of the cfg will be allowed
         self.cfg.freeze()
@@ -56,6 +82,8 @@ class Image_to_Image_Workflow(Base_Workflow):
 
     def define_activations_and_channels(self):
         """
+        Define the activations and output channels of the model.
+
         This function must define the following variables:
 
         self.model_output_channels : List of functions
@@ -74,6 +102,7 @@ class Image_to_Image_Workflow(Base_Workflow):
             "type": "image",
             "channels": [self.cfg.DATA.PATCH_SIZE[-1]],
         }
+        self.real_classes = self.model_output_channels["channels"][0]
         self.multihead = False
         self.activations = [{":": "Linear"}]
 
@@ -81,6 +110,8 @@ class Image_to_Image_Workflow(Base_Workflow):
 
     def define_metrics(self):
         """
+        Define the metrics to be used during training and test.
+
         This function must define the following variables:
 
         self.train_metrics : List of functions
@@ -165,9 +196,9 @@ class Image_to_Image_Workflow(Base_Workflow):
                 self.test_metric_names.append("LPIPS")
 
         if self.cfg.LOSS.TYPE == "MSE":
-            self.loss = torch.nn.MSELoss().to(self.device)
+            self.loss = loss_encapsulation(torch.nn.MSELoss().to(self.device))
         elif self.cfg.LOSS.TYPE == "MAE":
-            self.loss = torch.nn.L1Loss().to(self.device)
+            self.loss = loss_encapsulation(torch.nn.L1Loss().to(self.device))
         elif self.cfg.LOSS.TYPE == "SSIM":
             self.loss = SSIM_loss(data_range=data_range, device=self.device)
         elif self.cfg.LOSS.TYPE == "W_MAE_SSIM":
@@ -195,7 +226,7 @@ class Image_to_Image_Workflow(Base_Workflow):
         metric_logger: Optional[MetricLogger] = None,
     ) -> Dict:
         """
-        Execution of the metrics defined in :func:`~define_metrics` function.
+        Calculate the metrics defined in :func:`~define_metrics` function.
 
         Parameters
         ----------
@@ -216,6 +247,8 @@ class Image_to_Image_Workflow(Base_Workflow):
         out_metrics : dict
             Value of the metrics for the given prediction.
         """
+        if isinstance(output, dict):
+            output = output["pred"]
         if isinstance(output, np.ndarray):
             _output = to_pytorch_format(
                 output.copy(),
@@ -329,9 +362,7 @@ class Image_to_Image_Workflow(Base_Workflow):
         return out_metrics
 
     def process_test_sample(self):
-        """
-        Function to process a sample in the inference phase.
-        """
+        """Process a sample in the inference phase."""
         assert self.model
         # Skip processing image
         if "discard" in self.current_sample["X"] and self.current_sample["X"]["discard"]:
@@ -509,7 +540,7 @@ class Image_to_Image_Workflow(Base_Workflow):
 
     def after_merge_patches(self, pred):
         """
-        Steps need to be done after merging all predicted patches into the original image.
+        Execute steps needed after merging all predicted patches into the original image.
 
         Parameters
         ----------
@@ -520,7 +551,7 @@ class Image_to_Image_Workflow(Base_Workflow):
 
     def after_full_image(self, pred: NDArray):
         """
-        Steps that must be executed after generating the prediction by supplying the entire image to the model.
+        Execute steps needed after generating the prediction by supplying the entire image to the model.
 
         Parameters
         ----------
@@ -530,9 +561,7 @@ class Image_to_Image_Workflow(Base_Workflow):
         pass
 
     def after_all_images(self):
-        """
-        Steps that must be done after predicting all images.
-        """
+        """Execute steps needed after predicting all images."""
         # FID, IS and LPIPS need to be computed for all the images
         if self.use_gt:
             for i, metric in enumerate(self.test_metrics):
