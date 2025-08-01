@@ -631,7 +631,7 @@ class Config:
         # Path within the file where the ``locations`` are stored. Reference in CREMI: ``annotations/locations``
         _C.DATA.VAL.INPUT_ZARR_MULTIPLE_DATA_LOCATIONS_PATH = "annotations.locations"
         # Path within the file where the ``resolution`` is stored. Reference in CREMI: ``["volumes/raw"].attrs["offset"]``
-        _C.DATA.VAL.INPUT_ZARR_MULTIPLE_DATA_RESOLUTION_PATH = 'volumes.raw'
+        _C.DATA.VAL.INPUT_ZARR_MULTIPLE_DATA_RESOLUTION_PATH = 'volumes.raw'    
         # File to load/save data prepared with the appropiate channels in a instance segmentation problem.
         # E.g. _C.PROBLEM.TYPE ='INSTANCE_SEG' and _C.PROBLEM.INSTANCE_SEG.DATA_CHANNELS != 'B'
         _C.DATA.VAL.INSTANCE_CHANNELS_MASK_DIR = os.path.join(
@@ -798,6 +798,22 @@ class Config:
         _C.AUGMENTOR.DROPOUT = False
         # Range to take the probability to drop a pixel
         _C.AUGMENTOR.DROP_RANGE = (0, 0.2)
+        # Whether to apply SuperpixelMask augmentation (mask out regions based on superpixels)
+        _C.AUGMENTOR.SUPERPIXEL_MASK = False
+        # Range for the number of superpixel segments to generate (min, max)
+        _C.AUGMENTOR.SPM_RANGE = (100, 300)
+        # Fraction of the generated superpixel regions to mask out (0–1)
+        _C.AUGMENTOR.SPM_MASK_FRACTION = 0.5
+        # Whether to apply SuperpixelMask augmentation in 3D
+        _C.AUGMENTOR.SPM_3D = False
+        # Constant value to fill the masked superpixel regions
+        _C.AUGMENTOR.SPM_CVAL = 0
+        # If True, also zero out corresponding areas in the annotation/mask array
+        _C.AUGMENTOR.SPM_APPLY_TO_MASK = False
+        # Compactness parameter for SLIC: lower → edge‑following; higher → grid‑like
+        _C.AUGMENTOR.SP_COMPACTNESS   = 0.1
+        # Gaussian smoothing sigma before segmentation
+        _C.AUGMENTOR.SP_SIGMA         = 1.0
         # To fill one or more rectangular areas in an image using a fill mode
         _C.AUGMENTOR.CUTOUT = False
         # Range of number of areas to fill the image with. Reasonable values between range [0,4]

@@ -12,6 +12,7 @@ from typing import Tuple, Any, Union, Optional, List
 from numpy.typing import NDArray
 from scipy.ndimage import median_filter, interpolation, shift as shift_nd
 from skimage.transform import AffineTransform, warp
+from skimage.segmentation import slic
 
 
 def cutout(
@@ -2550,3 +2551,107 @@ def _map_coordinates(image, dx, dy, order=1, cval=0, mode="constant"):
         result = np.concatenate(result, axis=2)
 
     return result
+
+def superpixel_masking(
+    img: NDArray,
+    mask: NDArray,
+    resolution,
+    is_3d: bool = False,
+    n_segments: Tuple[int, int] = (100, 300),
+    mask_fraction: float = 0.1,
+    cval: int = 0,
+    apply_to_mask: bool = False,
+    compactness: float = 0.1,
+    sigma: float = 1.0,
+) -> Tuple[NDArray, NDArray]:
+    
+    """
+    SuperpixelMask augmentation: mask out regions based on superpixel segmentation.
+
+    This augmentation extracts a set of superpixels from the input image and then
+    randomly masks out a fraction of those superpixel regions by filling them
+    with a constant value. It can optionally apply the same masking to a
+    corresponding annotation/mask array.
+
+    Parameters
+    ----------
+    img : 3D Numpy array
+        The input image to be augmented, shape (H, W, C).
+    
+    mask : Numpy array
+        The annotation or segmentation mask corresponding to `img`,
+        shape (H, W) or (H, W, M).
+    
+    is_3d : bool, optional
+        Whether the image is 3D.
+    
+    n_segments : tuple of ints, optional
+        Range from which to uniformly sample the number of superpixels to generate.
+        E.g. ``(100, 300)``.
+    
+    mask_fraction : float, optional
+        Fraction of the generated superpixel regions to mask out.
+        Must be between 0 and 1, e.g. ``0.1`` masks 10% of the regions.
+    
+    cval : int, optional
+        Constant value with which to fill each masked superpixel region
+        (e.g. ``0`` for black).
+    
+    apply_to_mask : bool, optional
+        If ``True``, zero out the corresponding pixels in the `mask` array as well.
+    
+    channels : int, optional
+        Size or index of the channel dimension. Used for 3D inputs where channels
+        have been merged with the z axis. Set to None or -1 for last‑axis channels.
+    
+    compactness : float, optional
+        Balances color (or intensity) proximity and spatial proximity. Lower values
+        (<1) follow edges more tightly; higher values (>10) produce more regular
+        (grid‑like) regions. (logaritmic scale)
+    
+    sigma : float, optional
+        Standard deviation for Gaussian smoothing prior to segmentation. Higher
+        values → smoother input → cleaner region boundaries.
+
+    Returns
+    -------
+    out : 3D Numpy array
+        The augmented image, same shape as `img`.
+
+    m_out : Numpy array
+        The augmented mask, same shape as `mask`.
+    """
+
+    # Get segments
+    n = random.randint(n_segments[0], n_segments[1])
+
+    if is_3d:
+        channel_axis = None
+        spacing = resolution
+    else:
+        channel_axis = -1 
+        spacing = None      
+
+    segments = slic(
+        img,
+        n_segments=n,
+        compactness=compactness,
+        spacing=spacing, 
+        channel_axis=channel_axis,
+        sigma=sigma,
+    )
+
+    unique_labels = np.unique(segments)
+    n_to_mask = max(1, int(len(unique_labels) * mask_fraction))
+    labels_to_mask = np.random.choice(unique_labels, n_to_mask, replace=False)
+
+    out = img.copy()
+    m_out = mask.copy()
+
+    for lbl in labels_to_mask:
+        mask_region = (segments == lbl)
+        out[mask_region] = cval
+        if apply_to_mask:
+            m_out[mask_region] = cval
+
+    return out, m_out

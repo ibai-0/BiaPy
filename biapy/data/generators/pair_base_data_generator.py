@@ -159,6 +159,37 @@ class PairBaseDataGenerator(Dataset, metaclass=ABCMeta):
         Range to take a probability ``p`` to drop pixels. E.g. ``(0, 0.2)`` will take a ``p`` folowing ``0<=p<=0.2``
         and then drop ``p`` percent of all pixels in the image (i.e. convert them to black pixels).
 
+    superpixel_mask : bool, optional
+        Whether to apply SuperpixelMask augmentation (mask out regions based on superpixels).
+
+    spm_range : tuple of ints, optional
+        Range for the number of superpixel segments to generate.  
+        E.g. ``(100, 300)`` means randomly choose between 100 and 300 segments.
+
+    spm_is_3d : bool, optional
+        Whether to apply SuperpixelMask augmentation in 3D (volumetric) mode.
+        If True, superpixels are generated in 3D; if False, superpixels are generated per 2D slice.
+
+    spm_mask_fraction : float, optional
+        Fraction of the generated superpixel regions to mask out.  
+        Value between ``0`` and ``1`` (e.g. ``0.5`` masks half of the segments).
+
+    spm_cval : int, optional
+        Constant value with which to fill the masked superpixel regions.  
+        For example, ``0`` will zero out those regions.
+
+    spm_apply_to_mask : bool, optional
+        If ``True``, also zero out corresponding areas in the annotation/mask array.
+    
+    spm_compactness : float, optional
+        Balances color (or intensity) proximity and spatial proximity. Lower values
+        (<1) follow edges more tightly; higher values (>10) produce more regular
+        (grid‑like) regions.
+    
+    spm_sigma : float, optional
+        Standard deviation for Gaussian smoothing prior to segmentation. Higher
+        values → smoother input → cleaner region boundaries.
+
     cutout : bool, optional
         To fill one or more rectangular areas in an image using a fill mode.
 
@@ -392,6 +423,14 @@ class PairBaseDataGenerator(Dataset, metaclass=ABCMeta):
         contrast_mode: str = "2D",
         dropout: bool = False,
         drop_range: Tuple[float, float] = (0.0, 0.2),
+        superpixel_mask: bool = False,
+        spm_range: Tuple[int, int] = (100, 300),
+        spm_is_3d: bool = False,
+        spm_mask_fraction: float = 0.5,
+        spm_cval: int = 0,
+        spm_apply_to_mask: bool = False,
+        spm_compactness: float = 0.1,
+        spm_sigma: float = 1.0,
         cutout: bool = False,
         cout_nb_iterations: Tuple[int, int] = (1, 3),
         cout_size: Tuple[float, float] = (0.2, 0.4),
@@ -553,6 +592,14 @@ class PairBaseDataGenerator(Dataset, metaclass=ABCMeta):
         self.n_classes = n_classes
         self.da = da
         self.da_prob = da_prob
+        self.superpixel_mask = superpixel_mask
+        self.spm_range = spm_range
+        self.spm_is_3d = spm_is_3d
+        self.spm_mask_fraction = spm_mask_fraction
+        self.spm_cval = spm_cval
+        self.spm_apply_to_mask = spm_apply_to_mask
+        self.spm_compactness = spm_compactness
+        self.spm_sigma = spm_sigma
         self.cutout = cutout
         self.cout_nb_iterations = cout_nb_iterations
         self.cout_size = cout_size
@@ -1210,7 +1257,23 @@ class PairBaseDataGenerator(Dataset, metaclass=ABCMeta):
                 self.res_relation,
                 self.cout_apply_to_mask,
             )
-   
+
+        # Apply SuperPixel Masking
+        if self.superpixel_mask and random.uniform(0, 1) < self.da_prob:
+            image, mask = superpixel_masking(
+                image,
+                mask,
+                is_3d=self.spm_is_3d,
+                resolution= self.resolution, 
+                n_segments=self.spm_range,
+                mask_fraction=self.spm_mask_fraction,
+                cval=self.spm_cval,
+                apply_to_mask=self.spm_apply_to_mask,
+                compactness=self.spm_compactness,
+                sigma=self.spm_sigma
+            )
+        
+
         if self.elastic and random.uniform(0, 1) < self.da_prob:
             image, mask, heat = elastic(
                 image, mask=mask, heat=heat,
