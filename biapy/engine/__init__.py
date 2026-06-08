@@ -12,9 +12,10 @@ from yacs.config import CfgNode as CN
 from typing import Tuple, Union
 
 from biapy.engine.schedulers.warmup_cosine_decay import WarmUpCosineDecayScheduler
+from biapy.engine.schedulers.delayed_cosine_decay import DelayedCosineAnnealingScheduler
 from biapy.utils.callbacks import EarlyStopping
 
-Scheduler = Union[ReduceLROnPlateau, WarmUpCosineDecayScheduler, OneCycleLR]
+Scheduler = Union[ReduceLROnPlateau, WarmUpCosineDecayScheduler, OneCycleLR, DelayedCosineAnnealingScheduler]
 
 
 def prepare_optimizer(
@@ -92,6 +93,13 @@ def prepare_optimizer(
                     cfg.TRAIN.LR[i],
                     epochs=cfg.TRAIN.EPOCHS,
                     steps_per_epoch=steps_per_epoch,
+                )
+            elif cfg.TRAIN.LR_SCHEDULER.NAME == "delayedcosine":
+                lr_scheduler = DelayedCosineAnnealingScheduler(
+                    lr=cfg.TRAIN.LR[i],
+                    min_lr=cfg.TRAIN.LR_SCHEDULER.MIN_LR[i],
+                    epochs=cfg.TRAIN.EPOCHS,
+                    decay_fraction=cfg.TRAIN.LR_SCHEDULER.COSINE_DECAY_FRACTION,
                 )
         
         lr_schedulers.append(lr_scheduler)

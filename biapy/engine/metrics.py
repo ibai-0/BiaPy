@@ -13,13 +13,16 @@ import pandas as pd
 from scipy.spatial import distance_matrix
 from scipy.optimize import linear_sum_assignment
 from torchmetrics import JaccardIndex
-from torchmetrics.image import StructuralSimilarityIndexMeasure
+from torchmetrics.image import StructuralSimilarityIndexMeasure, LearnedPerceptualImagePatchSimilarity
 from pytorch_msssim import SSIM
 import torch.nn.functional as F
 import torch.nn as nn
 from torchvision import transforms
 from torchvision.models import vgg16, VGG16_Weights
 from typing import Optional, List, Tuple, Dict, Union
+from skimage.metrics import peak_signal_noise_ratio
+from skimage.transform import rescale as skimage_rescale
+from torchmetrics.functional.image import learned_perceptual_image_patch_similarity
 
 def jaccard_index_numpy(y_true, y_pred):
     """
@@ -2462,6 +2465,112 @@ class SpatialEmbLoss(nn.Module):
             "metrics": {"IoU": float(iou)}
         }
 
+def charbonnier_loss(pred, target, eps=1e-3):
+    """Charbonnier (robust L1) loss.
+
+    A smooth approximation of L1 loss that is differentiable everywhere.
+
+    Parameters
+    ----------
+    pred : torch.Tensor
+        Predicted tensor.
+    target : torch.Tensor
+        Target tensor.
+    eps : float
+        Numerical stability constant.
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar loss value.
+    """
+    diff = (pred - target).to(torch.float32)
+    return torch.mean(torch.sqrt(diff * diff + eps**2))
+
+
+def laplacian_loss(pred, target):
+    """Laplacian edge-preserving loss.
+
+    Computes L1 distance between Laplacian-filtered prediction and target,
+    emphasizing edge and high-frequency structure.
+
+    Parameters
+    ----------
+    pred : torch.Tensor
+        Predicted image tensor ``(B, C, H, W)``.
+    target : torch.Tensor
+        Target image tensor ``(B, C, H, W)``.
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar loss value.
+    """
+    kernel = torch.tensor([[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]],
+                          device=pred.device, dtype=pred.dtype).unsqueeze(0).unsqueeze(0)
+    channels = pred.shape[1]
+    kernel = kernel.repeat(channels, 1, 1, 1)
+    p = F.conv2d(pred, kernel, padding=1, groups=channels)
+    t = F.conv2d(target, kernel, padding=1, groups=channels)
+    return F.l1_loss(p, t)
+
+
+def fft_highfreq_loss(pred, target, eps=1e-6):
+    """Frequency-domain loss emphasizing high-frequency details.
+
+    Applies a radial distance mask to FFT magnitudes so that higher
+    spatial frequencies contribute more to the loss.
+
+    Parameters
+    ----------
+    pred : torch.Tensor
+        Predicted image tensor ``(B, 1, H, W)``.
+    target : torch.Tensor
+        Target image tensor ``(B, 1, H, W)``.
+    eps : float
+        Numerical stability constant.
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar loss value.
+    """
+    p = pred[:, 0].float()
+    t = target[:, 0].float()
+    mag_p = torch.abs(torch.fft.fftshift(torch.fft.fft2(p)))
+    mag_t = torch.abs(torch.fft.fftshift(torch.fft.fft2(t)))
+    mag_p = torch.clamp(mag_p, min=eps)
+    mag_t = torch.clamp(mag_t, min=eps)
+    B, H, W = mag_p.shape
+    yy = torch.arange(H, device=p.device) - H / 2
+    xx = torch.arange(W, device=p.device) - W / 2
+    Y, X = torch.meshgrid(yy, xx, indexing='ij')
+    dist = torch.sqrt(X**2 + Y**2)
+    mask = dist / (dist.max() + 1e-9)
+    mask = mask.unsqueeze(0)
+    return F.l1_loss(mask * mag_p, mask * mag_t)
+
+
+def normalize_to_minus_one_one(x: torch.Tensor) -> torch.Tensor:
+    """Min-max normalize a tensor to the range [-1, 1].
+
+    Used to bring arbitrary-range inputs (e.g. [0, 1] scale-range output)
+    into the [-1, 1] domain expected by perceptual losses (VGG, LPIPS, SSIM).
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Input tensor of any range.
+
+    Returns
+    -------
+    torch.Tensor
+        Tensor rescaled to [-1, 1].
+    """
+    x_min = x.min()
+    x_max = x.max()
+    return ((x - x_min) / (x_max - x_min + 1e-9)) * 2 - 1
+
 class VGG(nn.Module):
     """Perceptual loss based on VGG16 feature activations.
 
@@ -2498,8 +2607,26 @@ class VGG(nn.Module):
         for param in self.vgg.parameters():
             param.requires_grad = False
         self.loss = nn.L1Loss()
-        self.preprocess = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    
+        self.register_buffer(
+            "imagenet_mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
+        )
+        self.register_buffer(
+            "imagenet_std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
+        )
+
+    def _prep(self, x):
+        """Pre-process a tensor for VGG: normalize to [-1,1], expand to 3ch, then ImageNet stats."""
+        # 1. Min-max normalize to [-1, 1] (matches updated original)
+        x = normalize_to_minus_one_one(x)
+        # 2. Expand grayscale to 3 channels
+        if x.shape[1] == 1:
+            x = x.repeat(1, 3, 1, 1)
+        # 3. Convert [-1, 1] → [0, 1], then apply ImageNet normalization
+        x = (x + 1.0) / 2.0
+        return (x - self.imagenet_mean) / self.imagenet_std
+
     def forward(self, pred, target):
         """Compute perceptual distance between prediction and target.
 
@@ -2526,15 +2653,8 @@ class VGG(nn.Module):
             pred = pred.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
             target = target.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
 
-        # 2D behavior remains identical
-        if pred.shape[1] == 1:
-            pred = pred.repeat(1, 3, 1, 1)
-            target = target.repeat(1, 3, 1, 1)
-            
-        pred = self.preprocess(pred)
-        target = self.preprocess(target)
-        pred_vgg = self.vgg(pred)
-        target_vgg = self.vgg(target)
+        pred_vgg = self.vgg(self._prep(pred))
+        target_vgg = self.vgg(self._prep(target))
         return self.loss(pred_vgg, target_vgg)
 
 class CycleGanLoss(nn.Module):
@@ -2584,19 +2704,31 @@ class CycleGanLoss(nn.Module):
         self.w_vgg = cfg.LOSS.CYCLEGAN.ALPHA_PERCEPTUAL
         self.w_ssim = cfg.LOSS.CYCLEGAN.GAMMA_SSIM
         self.w_mse = cfg.LOSS.CYCLEGAN.DELTA_MSE
+        self.w_charb = cfg.LOSS.CYCLEGAN.LAMBDA_CHARP
+        self.w_lap = cfg.LOSS.CYCLEGAN.LAMBDA_LAP
+        self.w_edge = cfg.LOSS.CYCLEGAN.LAMBDA_EDGE
+        self.w_fft = cfg.LOSS.CYCLEGAN.LAMBDA_FFT
+        self.w_rfft = cfg.LOSS.CYCLEGAN.LAMBDA_RFFT
+        self.w_lpips = cfg.LOSS.CYCLEGAN.LAMBDA_LPIPS
+        self.r1_gamma = cfg.LOSS.CYCLEGAN.R1_GAMMA
+        self.gan_type = cfg.LOSS.CYCLEGAN.GAN_TYPE
 
-        # Dont load the vgg if not       
         if self.w_vgg > 0:
             self.vgg = VGG(device)
         if self.w_ssim > 0:
-            self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
-            
-        # Standard lightweight losses are always initialized
+            # data_range=2.0 because inputs are pre-normalized to [-1, 1] before SSIM
+            self.ssim = StructuralSimilarityIndexMeasure(data_range=2.0).to(device)
+        if self.w_lpips > 0:
+            self.lpips = LearnedPerceptualImagePatchSimilarity(net_type='alex', normalize=False).eval().to(device)
+            for param in self.lpips.parameters():
+                param.requires_grad = False
+
         self.l1 = nn.L1Loss()
         self.mse = nn.MSELoss()
         self.bce = nn.BCEWithLogitsLoss() 
+        self.step_count = 0
 
-    def forward_generator(self, pred, target, d_fake):
+    def forward_generator(self, pred, target, d_fake, noisy_input=None):
         """Compute weighted generator loss.
 
         Parameters
@@ -2607,6 +2739,9 @@ class CycleGanLoss(nn.Module):
             Ground-truth target. If dict, reads ``target['pred']``.
         d_fake : torch.Tensor
             Discriminator logits for generated samples.
+        noisy_input : torch.Tensor, optional
+            The original noisy/degraded input fed to the generator.
+            When provided, its statistics are printed in debug logs.
 
         Returns
         -------
@@ -2617,43 +2752,100 @@ class CycleGanLoss(nn.Module):
         if isinstance(pred, dict): pred = pred["pred"]
         if isinstance(target, dict): target = target["pred"]
 
-        # NaN Band-aid
         pred = torch.nan_to_num(pred, nan=0.0, posinf=1.0, neginf=-1.0)
         target = torch.nan_to_num(target, nan=0.0, posinf=1.0, neginf=-1.0)
 
+        self.step_count += 1
+        self._last_noisy_input = noisy_input  # store for debug
         total_loss = torch.tensor(0.0, device=self.device)
-        
-        # 2. Dynamically build the loss based on config weights
+        loss_dict = {}
+
         if self.w_l1 > 0:
-            total_loss += self.w_l1 * self.l1(pred, target)
-            
+            val = self.l1(pred, target)
+            total_loss += self.w_l1 * val
+            loss_dict["L1"] = val.item()
+
+        if self.w_charb > 0:
+            val = charbonnier_loss(pred, target)
+            total_loss += self.w_charb * val
+            loss_dict["Charbonnier"] = val.item()
+
         if self.w_mse > 0:
-            total_loss += self.w_mse * self.mse(pred, target)
-            
+            val = self.mse(pred, target)
+            total_loss += self.w_mse * val
+            loss_dict["MSE"] = val.item()
+
         if self.w_vgg > 0:
-            total_loss += self.w_vgg * self.vgg(pred, target)
-            
+            val = self.vgg(pred, target)
+            total_loss += self.w_vgg * val
+            loss_dict["VGG"] = val.item()
+
+        if self.w_lpips > 0:
+            val = self._lpips_loss(pred, target)
+            total_loss += self.w_lpips * val
+            loss_dict["LPIPS"] = val.item()
+
         if self.w_ssim > 0:
-            # SSIM requires 4D tensors. Safely route 3D to 2D slices.
+            pred_ssim_norm = normalize_to_minus_one_one(pred)
+            target_ssim_norm = normalize_to_minus_one_one(target)
             if pred.dim() == 5:
                 B, C, D, H, W = pred.shape
-                pred_ssim = pred.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
-                target_ssim = target.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
-                total_loss += self.w_ssim * (1.0 - self.ssim(pred_ssim, target_ssim))
-            else:
-                total_loss += self.w_ssim * (1.0 - self.ssim(pred, target))
-                
-        if self.w_gan > 0:
-            total_loss += self.w_gan * self.bce(d_fake, torch.ones_like(d_fake))
+                pred_ssim_norm = pred_ssim_norm.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
+                target_ssim_norm = target_ssim_norm.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
+            val = (1.0 - self.ssim(pred_ssim_norm, target_ssim_norm))
+            total_loss += self.w_ssim * val
+            loss_dict["SSIM"] = val.item()
 
-        # NaN Safety Check
+        total_lap_w = self.w_lap + self.w_edge
+        if total_lap_w > 0:
+            val = laplacian_loss(pred, target)
+            total_loss += total_lap_w * val
+            loss_dict["Laplacian"] = val.item()
+
+        if self.w_fft > 0:
+            val = fft_highfreq_loss(pred, target)
+            total_loss += self.w_fft * val
+            loss_dict["FFT"] = val.item()
+
+        if self.w_rfft > 0:
+            fft_pred = torch.fft.rfft2(normalize_to_minus_one_one(pred[:, 0, :, :].float()))
+            fft_target = torch.fft.rfft2(normalize_to_minus_one_one(target[:, 0, :, :].float()))
+            val = F.l1_loss(torch.abs(fft_pred), torch.abs(fft_target))
+            total_loss += self.w_rfft * val
+            loss_dict["RFFT"] = val.item()
+
+        if self.w_gan > 0:
+            if self.gan_type == "hinge":
+                val = F.softplus(-d_fake).mean()
+            else:
+                val = self.bce(d_fake, torch.ones_like(d_fake))
+            total_loss += self.w_gan * val
+            loss_dict["GAN_G"] = val.item()
+
+        if self.step_count % 50 == 1:
+            print(f"[DEBUG G Loss Step {self.step_count}] total_loss: {total_loss.item():.4f}")
+            for name, val in loss_dict.items():
+                if name == "GAN_G":
+                    weight = self.w_gan
+                elif name == "Laplacian":
+                    weight = total_lap_w
+                else:
+                    weight = getattr(self, f"w_{name.lower()}", 0.0)
+                print(f"  - {name} (weight {weight}): {val:.4f} (weighted: {weight * val:.4f})")
+            # --- INPUT stats (noisy image fed to generator) ---
+            noisy = getattr(self, '_last_noisy_input', None)
+            if noisy is not None:
+                print(f"  - INPUT  range: [{noisy.min().item():.4f}, {noisy.max().item():.4f}] (mean: {noisy.mean().item():.4f}, std: {noisy.std().item():.4f})")
+            print(f"  - pred   range: [{pred.min().item():.4f}, {pred.max().item():.4f}] (mean: {pred.mean().item():.4f})")
+            print(f"  - target range: [{target.min().item():.4f}, {target.max().item():.4f}] (mean: {target.mean().item():.4f})")
+
         if torch.isnan(total_loss):
             print("Warning: NaN detected in generator loss. Returning zero loss.")
             total_loss = torch.tensor(0.0, requires_grad=True).to(self.device)
 
         return total_loss
 
-    def forward_discriminator(self, d_real, d_fake):
+    def forward_discriminator(self, d_real, d_fake, real_images=None):
         """Compute discriminator adversarial loss.
 
         Uses BCE with one-sided label smoothing for real logits.
@@ -2664,20 +2856,526 @@ class CycleGanLoss(nn.Module):
             Discriminator logits for real samples.
         d_fake : torch.Tensor
             Discriminator logits for generated samples.
+        real_images : torch.Tensor, optional
+            Real image batch for R1 gradient penalty computation.
 
         Returns
         -------
         torch.Tensor
             Scalar discriminator loss.
         """
-        # Calculate Adversarial Loss for Discriminator
-        real_loss = self.bce(d_real, torch.full_like(d_real, 0.9)) # Label smoothing (0.9 instead of 1.0)
-        fake_loss = self.bce(d_fake, torch.zeros_like(d_fake))
-        total_loss = (real_loss + fake_loss) / 2.0
-        
-        # NaN Safety Check
+        loss_dict = {}
+        if self.gan_type == "hinge":
+            loss_real = torch.mean(F.relu(1.0 - d_real))
+            loss_fake = torch.mean(F.relu(1.0 + d_fake))
+            total_loss = 0.5 * (loss_real + loss_fake)
+            loss_dict["D_real"] = loss_real.item()
+            loss_dict["D_fake"] = loss_fake.item()
+        else:
+            real_loss = self.bce(d_real, torch.full_like(d_real, 0.9))
+            fake_loss = self.bce(d_fake, torch.zeros_like(d_fake))
+            total_loss = (real_loss + fake_loss) / 2.0
+            loss_dict["D_real"] = real_loss.item()
+            loss_dict["D_fake"] = fake_loss.item()
+
+        if real_images is not None and self.r1_gamma > 0:
+            penalty = self.calculate_r1_penalty(d_real, real_images)
+            total_loss = total_loss + penalty
+            loss_dict["R1_penalty"] = penalty.item()
+
+        if self.step_count % 50 == 1:
+            print(f"[DEBUG D Loss Step {self.step_count}] total_loss: {total_loss.item():.4f}")
+            print(f"  - D_real: {loss_dict['D_real']:.4f}")
+            print(f"  - D_fake: {loss_dict['D_fake']:.4f}")
+            if "R1_penalty" in loss_dict:
+                print(f"  - R1 (gamma {self.r1_gamma}): {loss_dict['R1_penalty']:.4f}")
+            d_real_mean = d_real.mean().item()
+            d_fake_mean = d_fake.mean().item()
+            print(f"  - d_real range: [{d_real.min().item():.4f}, {d_real.max().item():.4f}] (mean: {d_real_mean:.4f})")
+            print(f"  - d_fake range: [{d_fake.min().item():.4f}, {d_fake.max().item():.4f}] (mean: {d_fake_mean:.4f})")
+            # --- Saturation alarm ---
+            margin = abs(d_real_mean) + abs(d_fake_mean)
+            if margin > 10.0:
+                print(f"  ⚠️  SATURATION ALARM: D margin={margin:.1f} (real={d_real_mean:.1f}, fake={d_fake_mean:.1f}). Discriminator may have collapsed.")
+
         if torch.isnan(total_loss):
             print("Warning: NaN detected in discriminator loss. Returning zero loss.")
             total_loss = torch.tensor(0.0, requires_grad=True).to(self.device)
         
         return total_loss
+
+    def _lpips_loss(self, pred, target):
+        """Compute LPIPS perceptual loss with automatic normalization.
+
+        LPIPS expects input in [-1, 1]. Input tensors are re-normalized
+        from their current [0, 1] range.
+
+        Parameters
+        ----------
+        pred : torch.Tensor
+            Predicted image tensor ``(B, C, H, W)`` or ``(B, C, D, H, W)``.
+        target : torch.Tensor
+            Target image tensor with same shape as ``pred``.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar LPIPS loss.
+        """
+        # Min-max normalize to [-1, 1] (matches updated original, more robust than *2-1)
+        pred = normalize_to_minus_one_one(pred)
+        target = normalize_to_minus_one_one(target)
+        if pred.shape[1] == 1:
+            pred = pred.repeat(1, 3, 1, 1)
+            target = target.repeat(1, 3, 1, 1)
+        if pred.dim() == 5:
+            B, C, D, H, W = pred.shape
+            pred = pred.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
+            target = target.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
+        return self.lpips(pred, target).mean()
+
+    def calculate_r1_penalty(self, d_real_logits, real_images):
+        """Compute R1 gradient penalty for the discriminator.
+
+        Encourages discriminator smoothness around the real data manifold.
+
+        Parameters
+        ----------
+        d_real_logits : torch.Tensor
+            Discriminator logits for real samples.
+        real_images : torch.Tensor
+            Real image batch.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar R1 penalty (0.0 if disabled).
+        """
+        if self.r1_gamma <= 0:
+            return torch.tensor(0.0, device=self.device)
+        grads = torch.autograd.grad(
+            outputs=d_real_logits.sum(), inputs=real_images,
+            create_graph=True, retain_graph=True, only_inputs=True
+        )[0]
+        penalty = (grads.view(grads.size(0), -1).pow(2).sum(1)).mean()
+        return 0.5 * self.r1_gamma * penalty
+
+#------------------#
+#      LPIPS       #
+#------------------#
+
+class LPIPS_metric(nn.Module):
+    """Learned Perceptual Image Patch Similarity (LPIPS) metric wrapper."""
+    def __init__(self, device: torch.device, workflow=None):
+        super(LPIPS_metric, self).__init__()
+        self.lpips_fn = learned_perceptual_image_patch_similarity
+        self.device = device
+        self.workflow = workflow
+        self._lpips_cache = {}
+
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        filename = getattr(self.workflow, "current_sample", {}).get("X_filename", None) if self.workflow else None
+        if filename and filename in self._lpips_cache:
+            val = self._lpips_cache[filename]
+            return torch.tensor(val, dtype=torch.float32, device=y_pred.device)
+
+        # Ensure correct channels (repeat to 3 channels if grayscale)
+        if y_pred.shape[1] == 1:
+            _out_rgb = y_pred.repeat(1, 3, 1, 1)
+        else:
+            _out_rgb = y_pred.contiguous()
+
+        if y_true.shape[1] == 1:
+            tgt = y_true.repeat(1, 3, 1, 1)
+        else:
+            tgt = y_true.contiguous()
+
+        # LPIPS requires [-1, 1] range; min-max normalize first
+        _out_rgb = (_out_rgb - _out_rgb.min()) / (_out_rgb.max() - _out_rgb.min() + 1e-8) * 2 - 1
+        tgt = (tgt - tgt.min()) / (tgt.max() - tgt.min() + 1e-8) * 2 - 1
+
+        try:
+            val = self.lpips_fn(_out_rgb, tgt, net_type="alex", normalize=False)
+            val = val.item() if not torch.isnan(val) else 0.0
+        except Exception:
+            val = 0.0
+
+        if filename:
+            self._lpips_cache[filename] = val
+
+        return torch.tensor(val, dtype=torch.float32, device=y_pred.device)
+
+#------------------#
+#    MS_SI_PSNR    #
+#------------------#
+
+def _zero_mean(x: np.ndarray) -> np.ndarray:
+    return x - np.mean(x)
+
+def _fix_range(gt: np.ndarray, x: np.ndarray) -> np.ndarray:
+    denom = np.sum(x * x)
+    if denom == 0:
+        return x
+    a = np.sum(gt * x) / denom
+    return x * a
+
+def _fix(gt: np.ndarray, x: np.ndarray) -> np.ndarray:
+    gt_ = _zero_mean(gt)
+    return _fix_range(gt_, _zero_mean(x))
+
+def scale_invariant_psnr_np(gt: np.ndarray, pred: np.ndarray) -> float:
+    std_gt = np.std(gt)
+    if std_gt == 0:
+        std_gt = 1e-8
+    gt_range = np.max(gt) - np.min(gt)
+    range_parameter = gt_range / std_gt
+    if range_parameter == 0:
+        range_parameter = 1.0
+    
+    gt_normalized = _zero_mean(gt) / std_gt
+    gt_zero = _zero_mean(gt_normalized)
+    pred_fixed = _fix(gt_normalized, pred)
+    
+    try:
+        val = peak_signal_noise_ratio(gt_zero, pred_fixed, data_range=range_parameter)
+    except Exception:
+        val = 0.0
+    return val
+
+def ms_scale_invariant_psnr_np(gt: np.ndarray, pred: np.ndarray) -> float:
+    """Multi-Scale Scale-Invariant PSNR (MS-SI-PSNR).
+
+    Computes SI-PSNR across four spatial scales with weights
+    {0.0448, 0.2856, 0.3001, 0.3695}, as described in the NAFNet-GAN paper.
+    At each scale the prediction is linearly aligned to the ground truth via
+    least-squares regression before PSNR calculation.
+
+    Parameters
+    ----------
+    gt : np.ndarray
+        Ground truth image with shape ``(H, W)``.
+    pred : np.ndarray
+        Predicted image with shape ``(H, W)``.
+
+    Returns
+    -------
+    float
+        Weighted multi-scale SI-PSNR value.
+    """
+    weights = np.array([0.0448, 0.2856, 0.3001, 0.3695])
+    scales = 4
+    total = 0.0
+
+    for k in range(scales):
+        factor = 1.0 / (2 ** k)
+        if k == 0:
+            gt_s = gt
+            pred_s = pred
+        else:
+            gt_s = skimage_rescale(gt, factor, order=1, channel_axis=None, anti_aliasing=True)
+            pred_s = skimage_rescale(pred, factor, order=1, channel_axis=None, anti_aliasing=True)
+
+        total += weights[k] * scale_invariant_psnr_np(gt_s, pred_s)
+
+    return float(total)
+
+
+class MS_SI_PSNR_metric(nn.Module):
+    """Multi-Scale Scale-Invariant PSNR (MS-SI-PSNR) metric wrapper."""
+
+    def __init__(self):
+        super(MS_SI_PSNR_metric, self).__init__()
+
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        y_pred_np = y_pred.detach().cpu().numpy()
+        y_true_np = y_true.detach().cpu().numpy()
+
+        batch_size = y_pred_np.shape[0]
+        vals = []
+        for b in range(batch_size):
+            pred_2d = y_pred_np[b, 0]
+            gt_2d = y_true_np[b, 0]
+            vals.append(ms_scale_invariant_psnr_np(gt_2d, pred_2d))
+        return torch.tensor(np.mean(vals), dtype=torch.float32, device=y_pred.device)
+
+#------------------#
+#     MS_SSIM      #
+#------------------#
+
+def _fspecial_gauss_1d(size: int, sigma: float) -> torch.Tensor:
+    coords = torch.arange(size, dtype=torch.float)
+    coords -= size // 2
+
+    g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    g /= g.sum()
+
+    return g.unsqueeze(0).unsqueeze(0)
+
+def gaussian_filter(input: torch.Tensor, win: torch.Tensor) -> torch.Tensor:
+    assert all([ws == 1 for ws in win.shape[1:-1]]), win.shape
+    if len(input.shape) == 4:
+        conv = F.conv2d
+    elif len(input.shape) == 5:
+        conv = F.conv3d
+    else:
+        raise NotImplementedError(input.shape)
+
+    C = input.shape[1]
+    out = input
+    for i, s in enumerate(input.shape[2:]):
+        if s >= win.shape[-1]:
+            out = conv(out, weight=win.transpose(2 + i, -1), stride=1, padding=0, groups=C)
+        else:
+            print(
+                f"[WARNING]: Skipping Gaussian Smoothing at dimension 2+{i} for input: {input.shape} and win size: {win.shape[-1]}"
+            )
+
+    return out
+
+def _ssim(
+    X: torch.Tensor,
+    Y: torch.Tensor,
+    data_range: float,
+    win: torch.Tensor,
+    size_average: bool = True,
+    K: Union[Tuple[float, float], List[float]] = (0.01, 0.03)
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    K1, K2 = K
+    compensation = 1.0
+
+    C1 = (K1 * data_range) ** 2
+    C2 = (K2 * data_range) ** 2
+
+    win = win.to(X.device, dtype=X.dtype)
+
+    mu1 = gaussian_filter(X, win)
+    mu2 = gaussian_filter(Y, win)
+
+    mu1_sq = mu1.pow(2)
+    mu2_sq = mu2.pow(2)
+    mu1_mu2 = mu1 * mu2
+
+    sigma1_sq = compensation * (gaussian_filter(X * X, win) - mu1_sq)
+    sigma2_sq = compensation * (gaussian_filter(Y * Y, win) - mu2_sq)
+    sigma12 = compensation * (gaussian_filter(X * Y, win) - mu1_mu2)
+
+    cs_map = (2 * sigma12 + C2) / (sigma1_sq + sigma2_sq + C2)  # set alpha=beta=gamma=1
+    ssim_map = ((2 * mu1_mu2 + C1) / (mu1_sq + mu2_sq + C1)) * cs_map
+
+    ssim_per_channel = torch.flatten(ssim_map, 2).mean(-1)
+    cs = torch.flatten(cs_map, 2).mean(-1)
+    return ssim_per_channel, cs
+
+def ssim(
+    X: torch.Tensor,
+    Y: torch.Tensor,
+    data_range: float = 255,
+    size_average: bool = True,
+    win_size: int = 11,
+    win_sigma: float = 1.5,
+    win: Optional[torch.Tensor] = None,
+    K: Union[Tuple[float, float], List[float]] = (0.01, 0.03),
+    nonnegative_ssim: bool = False,
+) -> torch.Tensor:
+    if not X.shape == Y.shape:
+        raise ValueError(f"Input images should have the same dimensions, but got {X.shape} and {Y.shape}.")
+
+    for d in range(len(X.shape) - 1, 1, -1):
+        X = X.squeeze(dim=d)
+        Y = Y.squeeze(dim=d)
+
+    if len(X.shape) not in (4, 5):
+        raise ValueError(f"Input images should be 4-d or 5-d tensors, but got {X.shape}")
+
+    if win is not None:  # set win_size
+        win_size = win.shape[-1]
+
+    if not (win_size % 2 == 1):
+        raise ValueError("Window size should be odd.")
+
+    if win is None:
+        win = _fspecial_gauss_1d(win_size, win_sigma)
+        win = win.repeat([X.shape[1]] + [1] * (len(X.shape) - 1))
+
+    ssim_per_channel, cs = _ssim(X, Y, data_range=data_range, win=win, size_average=False, K=K)
+    if nonnegative_ssim:
+        ssim_per_channel = torch.relu(ssim_per_channel)
+
+    if size_average:
+        return ssim_per_channel.mean()
+    else:
+        return ssim_per_channel.mean(1)
+
+
+class PyTorchSSIM(torch.nn.Module):
+    def __init__(
+        self,
+        data_range: float = 255,
+        size_average: bool = True,
+        win_size: int = 11,
+        win_sigma: float = 1.5,
+        channel: int = 3,
+        spatial_dims: int = 2,
+        K: Union[Tuple[float, float], List[float]] = (0.01, 0.03),
+        nonnegative_ssim: bool = False,
+    ) -> None:
+        super(PyTorchSSIM, self).__init__()
+        self.win_size = win_size
+        self.win = _fspecial_gauss_1d(win_size, win_sigma).repeat([channel, 1] + [1] * spatial_dims)
+        self.size_average = size_average
+        self.data_range = data_range
+        self.K = K
+        self.nonnegative_ssim = nonnegative_ssim
+
+    def forward(self, X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+        return ssim(
+            X,
+            Y,
+            data_range=self.data_range,
+            size_average=self.size_average,
+            win=self.win,
+            K=self.K,
+            nonnegative_ssim=self.nonnegative_ssim,
+        )
+
+
+def ms_ssim(
+    X: torch.Tensor,
+    Y: torch.Tensor,
+    data_range: float = 255,
+    size_average: bool = True,
+    win_size: int = 11,
+    win_sigma: float = 1.5,
+    win: Optional[torch.Tensor] = None,
+    weights: Optional[List[float]] = None,
+    K: Union[Tuple[float, float], List[float]] = (0.01, 0.03)
+) -> torch.Tensor:
+    if not X.shape == Y.shape:
+        raise ValueError(f"Input images should have the same dimensions, but got {X.shape} and {Y.shape}.")
+
+    for d in range(len(X.shape) - 1, 1, -1):
+        X = X.squeeze(dim=d)
+        Y = Y.squeeze(dim=d)
+
+    if len(X.shape) == 4:
+        avg_pool = F.avg_pool2d
+    elif len(X.shape) == 5:
+        avg_pool = F.avg_pool3d
+    else:
+        raise ValueError(f"Input images should be 4-d or 5-d tensors, but got {X.shape}")
+
+    if win is not None:  # set win_size
+        win_size = win.shape[-1]
+
+    if not (win_size % 2 == 1):
+        raise ValueError("Window size should be odd.")
+
+    smaller_side = min(X.shape[-2:])
+    assert smaller_side > (win_size - 1) * (
+        2 ** 4
+    ), "Image size should be larger than %d due to the 4 downsamplings in ms-ssim" % ((win_size - 1) * (2 ** 4))
+
+    if weights is None:
+        weights = [0.0448, 0.2856, 0.3001, 0.2363, 0.1333]
+    weights_tensor = X.new_tensor(weights)
+
+    if win is None:
+        win = _fspecial_gauss_1d(win_size, win_sigma)
+        win = win.repeat([X.shape[1]] + [1] * (len(X.shape) - 1))
+
+    levels = weights_tensor.shape[0]
+    mcs = []
+    for i in range(levels):
+        ssim_per_channel, cs = _ssim(X, Y, win=win, data_range=data_range, size_average=False, K=K)
+
+        if i < levels - 1:
+            mcs.append(torch.relu(cs))
+            padding = [s % 2 for s in X.shape[2:]]
+            X = avg_pool(X, kernel_size=2, padding=padding)
+            Y = avg_pool(Y, kernel_size=2, padding=padding)
+
+    ssim_per_channel = torch.relu(ssim_per_channel)  # type: ignore  # (batch, channel)
+    mcs_and_ssim = torch.stack(mcs + [ssim_per_channel], dim=0)  # (level, batch, channel)
+    ms_ssim_val = torch.prod(mcs_and_ssim ** weights_tensor.view(-1, 1, 1), dim=0)
+
+    if size_average:
+        return ms_ssim_val.mean()
+    else:
+        return ms_ssim_val.mean(1)
+
+class PyTorchMS_SSIM(torch.nn.Module):
+    def __init__(
+        self,
+        data_range: float = 255,
+        size_average: bool = True,
+        win_size: int = 11,
+        win_sigma: float = 1.5,
+        channel: int = 3,
+        spatial_dims: int = 2,
+        weights: Optional[List[float]] = None,
+        K: Union[Tuple[float, float], List[float]] = (0.01, 0.03),
+    ) -> None:
+        super(PyTorchMS_SSIM, self).__init__()
+        self.win_size = win_size
+        self.win = _fspecial_gauss_1d(win_size, win_sigma).repeat([channel, 1] + [1] * spatial_dims)
+        self.size_average = size_average
+        self.data_range = data_range
+        self.weights = weights
+        self.K = K
+
+    def forward(self, X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+        return ms_ssim(
+            X,
+            Y,
+            data_range=self.data_range,
+            size_average=self.size_average,
+            win=self.win,
+            weights=self.weights,
+            K=self.K,
+        )
+
+class MS_SSIM_metric(nn.Module):
+    """Multiscale Structural Similarity Index Measure (MS-SSIM) metric wrapper."""
+    def __init__(self):
+        super(MS_SSIM_metric, self).__init__()
+
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        spatial_dims = len(y_pred.shape) - 2
+        channel = y_pred.shape[1]
+        smaller_side = min(y_pred.shape[-2:])
+        
+        levels = 3
+        win_size = 7
+        
+        while levels > 1 and smaller_side <= (win_size - 1) * (2 ** (levels - 1)):
+            levels -= 1
+        
+        while win_size > 3 and smaller_side <= (win_size - 1) * (2 ** (levels - 1)):
+            win_size -= 2
+            
+        if smaller_side <= (win_size - 1) * (2 ** (levels - 1)):
+            ssim_mod = PyTorchSSIM(data_range=1.0, size_average=True, win_size=win_size, channel=channel, spatial_dims=spatial_dims)
+            ssim_mod = ssim_mod.to(y_pred.device)
+            return ssim_mod(y_pred, y_true)
+            
+        if levels == 3:
+            weights = [0.25, 0.50, 0.25]
+        elif levels == 2:
+            weights = [0.3333, 0.6667]
+        else:
+            weights = [1.0]
+            
+        ms_ssim_mod = PyTorchMS_SSIM(
+            data_range=1.0,
+            size_average=True,
+            win_size=win_size,
+            channel=channel,
+            spatial_dims=spatial_dims,
+            weights=weights
+        )
+        ms_ssim_mod = ms_ssim_mod.to(y_pred.device)
+        try:
+            val = ms_ssim_mod(y_pred, y_true)
+        except Exception:
+            val = torch.tensor(0.0, device=y_pred.device)
+        return val

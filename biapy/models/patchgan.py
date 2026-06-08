@@ -35,17 +35,20 @@ class PatchGANDiscriminator(nn.Module):
     base_filters : int, optional
         Number of filters in the first discriminator block. Each subsequent
         block doubles this value.
+    n_layers : int, optional
+        Number of convolutional downsampling blocks. Default 4
+        (lightweight); use 5 for a deeper discriminator.
 
     Notes
     -----
     The architecture follows a typical PatchGAN design:
-    1. Four convolutional downsampling blocks.
+    1. ``n_layers`` convolutional downsampling blocks.
     2. Batch normalization on all blocks except the first one.
     3. LeakyReLU activations.
     4. Final convolution producing a patch-logits map.
     """
 
-    def __init__(self, in_channels=1, base_filters=64):
+    def __init__(self, in_channels=1, base_filters=64, n_layers=4):
         super(PatchGANDiscriminator, self).__init__()
         
         def discriminator_block(in_filters, out_filters, normalization=True):
@@ -71,12 +74,20 @@ class PatchGANDiscriminator(nn.Module):
             layers.append(nn.LeakyReLU(0.2, inplace=True))
             return layers
 
+        blocks = []
+        in_f = base_filters
+        for i in range(n_layers):
+            out_f = base_filters * (2 ** (i + 1))
+            blocks.extend(discriminator_block(
+                in_channels if i == 0 else in_f,
+                out_f,
+                normalization=(i > 0)
+            ))
+            in_f = out_f
+
         self.model = nn.Sequential(
-            *discriminator_block(in_channels, base_filters, normalization=False),
-            *discriminator_block(base_filters, base_filters * 2),
-            *discriminator_block(base_filters * 2, base_filters * 4),
-            *discriminator_block(base_filters * 4, base_filters * 8),
-            nn.Conv2d(base_filters * 8, 1, 4, stride=1, padding=1)  
+            *blocks,
+            nn.Conv2d(in_f, 1, 4, stride=1, padding=1)
         )
 
     def forward(self, img):

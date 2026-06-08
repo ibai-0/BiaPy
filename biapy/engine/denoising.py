@@ -12,6 +12,7 @@ import numpy as np
 import numpy.ma as ma
 from tqdm import tqdm
 from torchmetrics.regression import MeanSquaredError, MeanAbsoluteError
+from torchmetrics.image import StructuralSimilarityIndexMeasure
 from typing import Tuple, Callable, Dict, Optional
 from numpy.typing import NDArray
 
@@ -26,7 +27,7 @@ from biapy.data.data_3D_manipulation import (
 from biapy.engine.base_workflow import Base_Workflow
 from biapy.data.data_manipulation import save_tif
 from biapy.utils.misc import to_pytorch_format, to_numpy_format, is_main_process, MetricLogger
-from biapy.engine.metrics import n2v_loss_mse, loss_encapsulation, CycleGanLoss
+from biapy.engine.metrics import n2v_loss_mse, loss_encapsulation, CycleGanLoss, MS_SSIM_metric, MS_SI_PSNR_metric
 from biapy.data.norm import undo_image_norm, normalize_image
 from biapy.utils.util import check_downsample_division
 from biapy.data.post_processing.post_processing import ensemble8_2d_predictions
@@ -162,6 +163,18 @@ class Denoising_Workflow(Base_Workflow):
                 )
                 self.train_metric_names.append("MAE")
                 self.train_metric_best.append("min")
+            elif metric == "ms_ssim":
+                self.train_metrics.append(
+                    MS_SSIM_metric().to(self.device),
+                )
+                self.train_metric_names.append("MS_SSIM")
+                self.train_metric_best.append("max")
+            elif metric == "ms_si_psnr":
+                self.train_metrics.append(
+                    MS_SI_PSNR_metric().to(self.device),
+                )
+                self.train_metric_names.append("MS_SI_PSNR")
+                self.train_metric_best.append("max")
 
         self.test_metrics = []
         self.test_metric_names = []
@@ -176,6 +189,22 @@ class Denoising_Workflow(Base_Workflow):
                     MeanAbsoluteError().to(self.test_device),
                 )
                 self.test_metric_names.append("MAE")
+            elif metric == "ms_ssim":
+                self.test_metrics.append(
+                    MS_SSIM_metric().to(self.test_device),
+                )
+                self.test_metric_names.append("MS_SSIM")
+            elif metric == "ms_si_psnr":
+                self.test_metrics.append(
+                    MS_SI_PSNR_metric().to(self.test_device),
+                )
+                self.test_metric_names.append("MS_SI_PSNR")
+            elif metric == "lpips":
+                from biapy.engine.metrics import LPIPS_metric
+                self.test_metrics.append(
+                    LPIPS_metric(device=self.test_device, workflow=self).to(self.test_device),
+                )
+                self.test_metric_names.append("LPIPS")
 
         # print("Overriding 'LOSS.TYPE' to set it to N2V loss (masked MSE)")
         if self.cfg.LOSS.TYPE == "MSE":
@@ -282,7 +311,8 @@ class Denoising_Workflow(Base_Workflow):
                     target_for_metric = _targets.contiguous()
                 # Normal N2Void
                 else:
-                    target_for_metric = metric(_output.contiguous(), _targets[:, _output.shape[1]:].contiguous())
+                    target_for_metric = _targets[:, _output.shape[1]:].contiguous()
+
                 val = metric(_output.contiguous(), target_for_metric)
                 val = val.item() if not torch.isnan(val) else 0
                 out_metrics[list_names_to_use[i]] = val
@@ -402,6 +432,24 @@ class Denoising_Workflow(Base_Workflow):
                         -reflected_orig_shape[3] :,
                     ]  # type: ignore
 
+        # Calculate metrics in normalized space
+        if self.current_sample["Y"] is not None:
+            pred_norm = np.clip(pred.copy().astype(np.float32), 0, 1)
+            targets_norm, _ = normalize_image(self.current_sample["Y"].copy(), self.test_norm_module)
+            norm_metric_values = self.metric_calculation(output=pred_norm, targets=targets_norm, train=False)
+            # if self.cfg.TEST.VERBOSE:
+            #     print(f"[METRICS] [NORMALIZED] pred range: [{pred_norm.min():.4f}, {pred_norm.max():.4f}] (mean: {pred_norm.mean():.4f})")
+            #     print(f"[METRICS] [NORMALIZED] target range: [{targets_norm.min():.4f}, {targets_norm.max():.4f}] (mean: {targets_norm.mean():.4f})")
+            #     print("[METRICS] [NORMALIZED] values:")
+            #     for k, v in norm_metric_values.items():
+            #         print(f"  - {k}_norm: {v:.6f}")
+            for metric in norm_metric_values:
+                norm_key = f"{str(metric).lower()}_norm"
+                if norm_key not in self.stats["merge_patches"]:
+                    self.stats["merge_patches"][norm_key] = 0
+                self.stats["merge_patches"][norm_key] += norm_metric_values[metric]
+                self.current_sample_metrics[norm_key] = norm_metric_values[metric]
+
         # Undo normalization
         pred = undo_image_norm(pred, self.current_sample["X_norm"])
         assert isinstance(pred, np.ndarray)
@@ -419,6 +467,15 @@ class Denoising_Workflow(Base_Workflow):
         # Calculate metrics
         if self.current_sample["Y"] is not None:
             metric_values = self.metric_calculation(output=pred, targets=self.current_sample["Y"], train=False)
+            # targets_unnorm = self.current_sample["Y"].copy().astype(np.float32)
+            # if self.cfg.TEST.VERBOSE:
+            #     print(f"[METRICS] [RAW] pred range: [{pred.min():.4f}, {pred.max():.4f}] (mean: {pred.mean():.4f})")
+            #     print(f"[METRICS] [RAW] target range: [{targets_unnorm.min():.4f}, {targets_unnorm.max():.4f}] (mean: {targets_unnorm.mean():.4f})")
+            # metric_values = self.metric_calculation(output=pred, targets=targets_unnorm, train=False)
+            # if self.cfg.TEST.VERBOSE:
+            #     print("[METRICS] [RAW] values:")
+            #     for k, v in metric_values.items():
+            #         print(f"  - {k}: {v:.6f}")
             for metric in metric_values:
                 if str(metric).lower() not in self.stats["merge_patches"]:
                     self.stats["merge_patches"][str(metric).lower()] = 0
@@ -470,6 +527,17 @@ class Denoising_Workflow(Base_Workflow):
     def after_all_images(self):
         """Excute steps that must be done after predicting all images."""
         super().after_all_images()
+
+    def print_stats(self, image_counter):
+        """Print statistics including normalized metrics."""
+        super().print_stats(image_counter)
+        if self.cfg.DATA.TEST.LOAD_GT:
+            for metric in ["mse_norm", "mae_norm", "psnr_norm", "si_psnr_norm", "ssim_norm", "ms_ssim_norm", "ms_si_psnr_norm", "lpips"]:
+                if metric in self.stats["merge_patches"]:
+                    print("Test {} (normalized space): {}".format(
+                        metric.upper(),
+                        self.stats["merge_patches"][metric],
+                    ))
 
 ####################################
 # Adapted from N2V code:           #

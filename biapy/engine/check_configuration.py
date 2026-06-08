@@ -1179,11 +1179,11 @@ def check_configuration(cfg, jobname, check_data_paths=True):
             opts.extend(["TEST.METRICS", ["mae", "mse"]])
 
         assert len(cfg.TRAIN.METRICS) == 0 or all(
-            [True if x.lower() in ["mae", "mse"] else False for x in cfg.TRAIN.METRICS]
-        ), f"'TRAIN.METRICS' options are ['mae', 'mse'] in {cfg.PROBLEM.TYPE} workflow"
+            [True if x.lower() in ["mae", "mse", "ms_ssim","ms_si_psnr", "lpips" ] else False for x in cfg.TRAIN.METRICS]
+        ), f"'TRAIN.METRICS' options are ['mae', 'mse', 'ms_ssim','ms_si_psnr', 'lpips' ] in {cfg.PROBLEM.TYPE} workflow"
         assert len(cfg.TEST.METRICS) == 0 or all(
-            [True if x.lower() in ["mae", "mse"] else False for x in cfg.TEST.METRICS]
-        ), f"'TEST.METRICS' options are ['mae', 'mse'] in {cfg.PROBLEM.TYPE} workflow"
+            [True if x.lower() in ["mae", "mse", "ms_ssim","ms_si_psnr", "lpips" ] else False for x in cfg.TEST.METRICS]
+        ), f"'TEST.METRICS' options are ['mae', 'mse', 'ms_ssim','ms_si_psnr', 'lpips' ] in {cfg.PROBLEM.TYPE} workflow"
 
     elif cfg.PROBLEM.TYPE == "CLASSIFICATION":
         if set_train_metrics:
@@ -2838,8 +2838,9 @@ def check_configuration(cfg, jobname, check_data_paths=True):
             "reduceonplateau",
             "warmupcosine",
             "onecycle",
+            "delayedcosine",
         ]:
-            raise ValueError("'TRAIN.LR_SCHEDULER.NAME' must be in ['reduceonplateau', 'warmupcosine', 'onecycle']")
+            raise ValueError("'TRAIN.LR_SCHEDULER.NAME' must be in ['reduceonplateau', 'warmupcosine', 'onecycle', 'delayedcosine']")
         if cfg.TRAIN.LR_SCHEDULER.NAME != "onecycle":
             if not isinstance(cfg.TRAIN.LR_SCHEDULER.MIN_LR, list):
                 raise ValueError("'TRAIN.LR_SCHEDULER.MIN_LR' must be a list")

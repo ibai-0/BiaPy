@@ -9,4 +9,5 @@ from . import warmup_cosine_decay
 
 __all__ = [
     "warmup_cosine_decay",
+    "delayer_cosine_decay",
 ]

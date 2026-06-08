@@ -1594,6 +1594,8 @@ class Config:
         _C.MODEL.NAFNET.PATCHGAN = CN()
         # Number of initial convolutional filters in the first layer of the discriminator.
         _C.MODEL.NAFNET.PATCHGAN.BASE_FILTERS = 64
+        # Number of convolutional downsampling blocks in the discriminator.
+        _C.MODEL.NAFNET.PATCHGAN.N_LAYERS = 4
 
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # 6. Loss definition options
@@ -1660,16 +1662,32 @@ class Config:
         # Fine-grained GAN composition. Set any weight to 0.0 to disable that term.
         # Used when LOSS.TYPE == "CYCLEGAN".
         _C.LOSS.CYCLEGAN = CN()
-        # Weight for adversarial BCE term.
+        # GAN loss type: "bce" (label smoothing) or "hinge".
+        _C.LOSS.CYCLEGAN.GAN_TYPE = "bce"
+        # Weight for adversarial BCE/hinge term.
         _C.LOSS.CYCLEGAN.LAMBDA_GAN = 1.0
         # Weight for L1 reconstruction term.
         _C.LOSS.CYCLEGAN.LAMBDA_RECON = 10.0
+        # Weight for Charbonnier (robust L1) reconstruction term.
+        _C.LOSS.CYCLEGAN.LAMBDA_CHARP = 0.0
         # Weight for MSE reconstruction term.
         _C.LOSS.CYCLEGAN.DELTA_MSE = 0.0
         # Weight for VGG perceptual term.
         _C.LOSS.CYCLEGAN.ALPHA_PERCEPTUAL = 0.0
+        # Weight for LPIPS perceptual term.
+        _C.LOSS.CYCLEGAN.LAMBDA_LPIPS = 0.0
         # Weight for SSIM term.
         _C.LOSS.CYCLEGAN.GAMMA_SSIM = 1.0
+        # Weight for Laplacian edge loss term.
+        _C.LOSS.CYCLEGAN.LAMBDA_LAP = 0.0
+        # Weight for edge loss term (adds to LAMBDA_LAP internally).
+        _C.LOSS.CYCLEGAN.LAMBDA_EDGE = 0.0
+        # Weight for FFT high-frequency loss term.
+        _C.LOSS.CYCLEGAN.LAMBDA_FFT = 0.0
+        # Weight for RFFT L1 loss term.
+        _C.LOSS.CYCLEGAN.LAMBDA_RFFT = 0.0
+        # R1 gradient penalty coefficient (0.0 to disable).
+        _C.LOSS.CYCLEGAN.R1_GAMMA = 0.0
 
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # 7. Training phase options
@@ -1721,7 +1739,7 @@ class Config:
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # LR Scheduler
         _C.TRAIN.LR_SCHEDULER = CN()
-        _C.TRAIN.LR_SCHEDULER.NAME = ""  # Possible options: 'warmupcosine', 'reduceonplateau', 'onecycle'
+        _C.TRAIN.LR_SCHEDULER.NAME = ""  # Possible options: 'warmupcosine', 'reduceonplateau', 'onecycle', 'delayedcosine'
         # Lower bound on the learning rate used in 'warmupcosine' and 'reduceonplateau'
         _C.TRAIN.LR_SCHEDULER.MIN_LR = [-1.0]
 
@@ -1747,6 +1765,14 @@ class Config:
         #
         # Epochs to do the warming up.
         _C.TRAIN.LR_SCHEDULER.WARMUP_COSINE_DECAY_EPOCHS = -1
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # 7.1.3 Delayed cosine annealing options
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Keeps the learning rate constant for the first
+        # (1 - COSINE_DECAY_FRACTION) fraction of epochs, then applies a
+        # single half-period cosine decay to MIN_LR over the final fraction.
+        _C.TRAIN.LR_SCHEDULER.COSINE_DECAY_FRACTION = 0.2
 
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # 8. Test/inference phase options

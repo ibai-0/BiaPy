@@ -215,7 +215,8 @@ class NAFNet(nn.Module):
         dw_expand=2,         
         ffn_expand=2,
         discriminator_arch=None,
-        patchgan_base_filters=64,     
+        patchgan_base_filters=64,
+        patchgan_n_layers=4,     
     ):
         """Initialize a NAFNet model.
 
@@ -237,6 +238,14 @@ class NAFNet(nn.Module):
             Expansion ratio for depthwise branch.
         ffn_expand : int, optional
             Expansion ratio for feed-forward branch.
+        discriminator_arch : str or None, optional
+            Discriminator architecture name (e.g. ``"patchgan"``). ``None``
+            disables the discriminator.
+        patchgan_base_filters : int, optional
+            Number of filters in the first discriminator block.
+        patchgan_n_layers : int, optional
+            Number of convolutional downsampling blocks in the PatchGAN
+            discriminator.
 
         Notes
         -----
@@ -292,6 +301,7 @@ class NAFNet(nn.Module):
             discriminator = PatchGANDiscriminator(
                 in_channels=img_channel,
                 base_filters=patchgan_base_filters,
+                n_layers=patchgan_n_layers,
             )
 
         self.discriminator = discriminator
@@ -387,9 +397,10 @@ class NAFNet(nn.Module):
         for p in self.discriminator.parameters():
             p.requires_grad_(True)
 
-        d_real = self.discriminator(targets)
+        real_imgs = targets.detach().requires_grad_(True)
+        d_real = self.discriminator(real_imgs)
         d_fake = self.discriminator(fake_img.detach())
-        loss_d = loss_fn.forward_discriminator(d_real, d_fake)
+        loss_d = loss_fn.forward_discriminator(d_real, d_fake, real_imgs)
 
         return (loss_g, loss_d)
 

@@ -203,6 +203,12 @@ def train_one_epoch(
     # Gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("[Train] averaged stats:", metric_logger)
+
+    if cfg.TRAIN.LR_SCHEDULER.NAME == "delayedcosine":
+        for sched, opt in zip(lr_scheduler, optimizer):
+            if sched:
+                sched.adjust_learning_rate(opt, epoch)
+
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, step
 
 
