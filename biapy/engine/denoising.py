@@ -528,17 +528,6 @@ class Denoising_Workflow(Base_Workflow):
         """Excute steps that must be done after predicting all images."""
         super().after_all_images()
 
-    def print_stats(self, image_counter):
-        """Print statistics including normalized metrics."""
-        super().print_stats(image_counter)
-        if self.cfg.DATA.TEST.LOAD_GT:
-            for metric in ["mse_norm", "mae_norm", "psnr_norm", "si_psnr_norm", "ssim_norm", "ms_ssim_norm", "ms_si_psnr_norm", "lpips"]:
-                if metric in self.stats["merge_patches"]:
-                    print("Test {} (normalized space): {}".format(
-                        metric.upper(),
-                        self.stats["merge_patches"][metric],
-                    ))
-
 ####################################
 # Adapted from N2V code:           #
 #   https://github.com/juglab/n2v  #
