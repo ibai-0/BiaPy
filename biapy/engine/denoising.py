@@ -12,7 +12,7 @@ import numpy as np
 import numpy.ma as ma
 from tqdm import tqdm
 from torchmetrics.regression import MeanSquaredError, MeanAbsoluteError
-from torchmetrics.image import StructuralSimilarityIndexMeasure
+from torchmetrics.image import StructuralSimilarityIndexMeasure, PeakSignalNoiseRatio
 from typing import Tuple, Callable, Dict, Optional
 from numpy.typing import NDArray
 
@@ -175,6 +175,18 @@ class Denoising_Workflow(Base_Workflow):
                 )
                 self.train_metric_names.append("MS_SI_PSNR")
                 self.train_metric_best.append("max")
+            elif metric == "ssim":
+                self.train_metrics.append(
+                    StructuralSimilarityIndexMeasure().to(self.device),
+                )
+                self.train_metric_names.append("SSIM")
+                self.train_metric_best.append("max")
+            elif metric == "psnr":
+                self.train_metrics.append(
+                    PeakSignalNoiseRatio().to(self.device),
+                )
+                self.train_metric_names.append("PSNR")
+                self.train_metric_best.append("max")
 
         self.test_metrics = []
         self.test_metric_names = []
@@ -199,6 +211,16 @@ class Denoising_Workflow(Base_Workflow):
                     MS_SI_PSNR_metric().to(self.test_device),
                 )
                 self.test_metric_names.append("MS_SI_PSNR")
+            elif metric == "ssim":
+                self.test_metrics.append(
+                    StructuralSimilarityIndexMeasure().to(self.test_device),
+                )
+                self.test_metric_names.append("SSIM")
+            elif metric == "psnr":
+                self.test_metrics.append(
+                    PeakSignalNoiseRatio().to(self.test_device),
+                )
+                self.test_metric_names.append("PSNR")
             elif metric == "lpips":
                 from biapy.engine.metrics import LPIPS_metric
                 self.test_metrics.append(
@@ -467,15 +489,6 @@ class Denoising_Workflow(Base_Workflow):
         # Calculate metrics
         if self.current_sample["Y"] is not None:
             metric_values = self.metric_calculation(output=pred, targets=self.current_sample["Y"], train=False)
-            # targets_unnorm = self.current_sample["Y"].copy().astype(np.float32)
-            # if self.cfg.TEST.VERBOSE:
-            #     print(f"[METRICS] [RAW] pred range: [{pred.min():.4f}, {pred.max():.4f}] (mean: {pred.mean():.4f})")
-            #     print(f"[METRICS] [RAW] target range: [{targets_unnorm.min():.4f}, {targets_unnorm.max():.4f}] (mean: {targets_unnorm.mean():.4f})")
-            # metric_values = self.metric_calculation(output=pred, targets=targets_unnorm, train=False)
-            # if self.cfg.TEST.VERBOSE:
-            #     print("[METRICS] [RAW] values:")
-            #     for k, v in metric_values.items():
-            #         print(f"  - {k}: {v:.6f}")
             for metric in metric_values:
                 if str(metric).lower() not in self.stats["merge_patches"]:
                     self.stats["merge_patches"][str(metric).lower()] = 0
@@ -527,6 +540,31 @@ class Denoising_Workflow(Base_Workflow):
     def after_all_images(self):
         """Excute steps that must be done after predicting all images."""
         super().after_all_images()
+
+    def print_stats(self, image_counter):
+        """Print statistics including normalized metrics."""
+        super().print_stats(image_counter)
+        if self.cfg.DATA.TEST.LOAD_GT:
+            for metric in ["mse_norm", "mae_norm", "psnr_norm", "si_psnr_norm", "ssim_norm", "ms_ssim_norm", "ms_si_psnr_norm", "lpips"]:
+                if metric in self.stats["merge_patches"]:
+                    print("Test {} (normalized space): {}".format(
+                        metric.upper(),
+                        self.stats["merge_patches"][metric],
+                    ))
+
+    def after_all_chunk_prediction_workflow_process(self):
+        """
+        Place any code that needs to be done after predicting all patches in "by chunks" setting.
+        This function is called on all ranks.
+        """
+        pass
+
+    def after_all_chunk_prediction_workflow_process_master_rank(self):
+        """
+        Place any code that needs to be done after predicting all patches in "by chunks" setting, but only on the master rank.
+        This function is called only on the master rank.
+        """
+        pass
 
 ####################################
 # Adapted from N2V code:           #

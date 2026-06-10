@@ -398,6 +398,7 @@ def build_model(
                 discriminator_arch=cfg.MODEL.NAFNET.ARCHITECTURE_D,
                 patchgan_base_filters=cfg.MODEL.NAFNET.PATCHGAN.BASE_FILTERS,
                 patchgan_n_layers=cfg.MODEL.NAFNET.PATCHGAN.N_LAYERS,
+                ndim=ndim,
             )
             callable_model = NAFNet   # type: ignore
             model = callable_model(**args)  # type: ignore

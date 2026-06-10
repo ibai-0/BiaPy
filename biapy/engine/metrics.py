@@ -2542,21 +2542,36 @@ def laplacian_loss(pred, target):
     Parameters
     ----------
     pred : torch.Tensor
-        Predicted image tensor ``(B, C, H, W)``.
+        Predicted image tensor ``(B, C, H, W)`` or ``(B, C, D, H, W)``.
     target : torch.Tensor
-        Target image tensor ``(B, C, H, W)``.
+        Target image tensor of same shape as ``pred``.
 
     Returns
     -------
     torch.Tensor
         Scalar loss value.
     """
-    kernel = torch.tensor([[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]],
-                          device=pred.device, dtype=pred.dtype).unsqueeze(0).unsqueeze(0)
+    ndim = pred.dim() - 2
     channels = pred.shape[1]
-    kernel = kernel.repeat(channels, 1, 1, 1)
-    p = F.conv2d(pred, kernel, padding=1, groups=channels)
-    t = F.conv2d(target, kernel, padding=1, groups=channels)
+
+    if ndim == 3:
+        # 3D Laplacian kernel: center -6, 6-neighbors are 1, others 0
+        kernel = torch.tensor([
+            [[0., 0., 0.], [0., 1., 0.], [0., 0., 0.]],
+            [[0., 1., 0.], [1., -6., 1.], [0., 1., 0.]],
+            [[0., 0., 0.], [0., 1., 0.], [0., 0., 0.]]
+        ], device=pred.device, dtype=pred.dtype).unsqueeze(0).unsqueeze(0)
+        kernel = kernel.repeat(channels, 1, 1, 1, 1)
+        p = F.conv3d(pred, kernel, padding=1, groups=channels)
+        t = F.conv3d(target, kernel, padding=1, groups=channels)
+    else:
+        # 2D Laplacian kernel: center -4, 4-neighbors are 1, others 0
+        kernel = torch.tensor([[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]],
+                              device=pred.device, dtype=pred.dtype).unsqueeze(0).unsqueeze(0)
+        kernel = kernel.repeat(channels, 1, 1, 1)
+        p = F.conv2d(pred, kernel, padding=1, groups=channels)
+        t = F.conv2d(target, kernel, padding=1, groups=channels)
+
     return F.l1_loss(p, t)
 
 
@@ -2569,9 +2584,9 @@ def fft_highfreq_loss(pred, target, eps=1e-6):
     Parameters
     ----------
     pred : torch.Tensor
-        Predicted image tensor ``(B, 1, H, W)``.
+        Predicted image tensor ``(B, 1, H, W)`` or ``(B, 1, D, H, W)``.
     target : torch.Tensor
-        Target image tensor ``(B, 1, H, W)``.
+        Target image tensor same shape as ``pred``.
     eps : float
         Numerical stability constant.
 
@@ -2582,17 +2597,35 @@ def fft_highfreq_loss(pred, target, eps=1e-6):
     """
     p = pred[:, 0].float()
     t = target[:, 0].float()
-    mag_p = torch.abs(torch.fft.fftshift(torch.fft.fft2(p)))
-    mag_t = torch.abs(torch.fft.fftshift(torch.fft.fft2(t)))
-    mag_p = torch.clamp(mag_p, min=eps)
-    mag_t = torch.clamp(mag_t, min=eps)
-    B, H, W = mag_p.shape
-    yy = torch.arange(H, device=p.device) - H / 2
-    xx = torch.arange(W, device=p.device) - W / 2
-    Y, X = torch.meshgrid(yy, xx, indexing='ij')
-    dist = torch.sqrt(X**2 + Y**2)
-    mask = dist / (dist.max() + 1e-9)
-    mask = mask.unsqueeze(0)
+
+    if p.dim() == 4: # 3D batch: (B, D, H, W)
+        B, D, H, W = p.shape
+        mag_p = torch.abs(torch.fft.fftshift(torch.fft.fftn(p, dim=(-3, -2, -1))))
+        mag_t = torch.abs(torch.fft.fftshift(torch.fft.fftn(t, dim=(-3, -2, -1))))
+        mag_p = torch.clamp(mag_p, min=eps)
+        mag_t = torch.clamp(mag_t, min=eps)
+
+        zz = torch.arange(D, device=p.device) - D / 2
+        yy = torch.arange(H, device=p.device) - H / 2
+        xx = torch.arange(W, device=p.device) - W / 2
+        Z, Y, X = torch.meshgrid(zz, yy, xx, indexing='ij')
+        dist = torch.sqrt(X**2 + Y**2 + Z**2)
+        mask = dist / (dist.max() + 1e-9)
+        mask = mask.unsqueeze(0)
+    else: # 2D batch: (B, H, W)
+        mag_p = torch.abs(torch.fft.fftshift(torch.fft.fft2(p)))
+        mag_t = torch.abs(torch.fft.fftshift(torch.fft.fft2(t)))
+        mag_p = torch.clamp(mag_p, min=eps)
+        mag_t = torch.clamp(mag_t, min=eps)
+
+        B, H, W = mag_p.shape
+        yy = torch.arange(H, device=p.device) - H / 2
+        xx = torch.arange(W, device=p.device) - W / 2
+        Y, X = torch.meshgrid(yy, xx, indexing='ij')
+        dist = torch.sqrt(X**2 + Y**2)
+        mask = dist / (dist.max() + 1e-9)
+        mask = mask.unsqueeze(0)
+
     return F.l1_loss(mask * mag_p, mask * mag_t)
 
 
@@ -2762,8 +2795,13 @@ class CycleGanLoss(nn.Module):
             self.vgg = VGG(device)
         if self.w_ssim > 0:
             # data_range=2.0 because inputs are pre-normalized to [-1, 1] before SSIM
-            self.ssim = StructuralSimilarityIndexMeasure(data_range=2.0).to(device)
+            if cfg.PROBLEM.NDIM == "3D":
+                self.ssim = PyTorchSSIM(data_range=2.0, size_average=True, channel=cfg.DATA.PATCH_SIZE[-1], spatial_dims=3).to(device)
+            else:
+                self.ssim = StructuralSimilarityIndexMeasure(data_range=2.0).to(device)
         if self.w_lpips > 0:
+            if cfg.PROBLEM.NDIM == "3D":
+                raise ValueError("LPIPS loss is only supported for 2D workflows.")
             self.lpips = LearnedPerceptualImagePatchSimilarity(net_type='alex', normalize=False).eval().to(device)
             for param in self.lpips.parameters():
                 param.requires_grad = False
@@ -2833,7 +2871,7 @@ class CycleGanLoss(nn.Module):
         if self.w_ssim > 0:
             pred_ssim_norm = normalize_to_minus_one_one(pred)
             target_ssim_norm = normalize_to_minus_one_one(target)
-            if pred.dim() == 5:
+            if pred.dim() == 5 and not isinstance(self.ssim, PyTorchSSIM):
                 B, C, D, H, W = pred.shape
                 pred_ssim_norm = pred_ssim_norm.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
                 target_ssim_norm = target_ssim_norm.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
@@ -2853,8 +2891,12 @@ class CycleGanLoss(nn.Module):
             loss_dict["FFT"] = val.item()
 
         if self.w_rfft > 0:
-            fft_pred = torch.fft.rfft2(normalize_to_minus_one_one(pred[:, 0, :, :].float()))
-            fft_target = torch.fft.rfft2(normalize_to_minus_one_one(target[:, 0, :, :].float()))
+            if pred.dim() == 5:
+                fft_pred = torch.fft.rfftn(normalize_to_minus_one_one(pred[:, 0].float()), dim=(-3, -2, -1))
+                fft_target = torch.fft.rfftn(normalize_to_minus_one_one(target[:, 0].float()), dim=(-3, -2, -1))
+            else:
+                fft_pred = torch.fft.rfft2(normalize_to_minus_one_one(pred[:, 0, :, :].float()))
+                fft_target = torch.fft.rfft2(normalize_to_minus_one_one(target[:, 0, :, :].float()))
             val = F.l1_loss(torch.abs(fft_pred), torch.abs(fft_target))
             total_loss += self.w_rfft * val
             loss_dict["RFFT"] = val.item()
@@ -2996,7 +3038,7 @@ class CycleGanLoss(nn.Module):
         torch.Tensor
             Scalar R1 penalty (0.0 if disabled).
         """
-        if self.r1_gamma <= 0:
+        if self.r1_gamma <= 0 or not d_real_logits.requires_grad:
             return torch.tensor(0.0, device=self.device)
         grads = torch.autograd.grad(
             outputs=d_real_logits.sum(), inputs=real_images,

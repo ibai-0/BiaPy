@@ -14,8 +14,8 @@ PatchGANDiscriminator
 
 Notes
 -----
-The output tensor shape is `(N, 1, H_patch, W_patch)`, where each spatial value
-acts as a local real/fake logit for a receptive-field patch in the input image.
+The output tensor shape is `(N, 1, H_patch, W_patch)` or `(N, 1, D_patch, H_patch, W_patch)`,
+where each spatial value acts as a local real/fake logit for a receptive-field patch in the input image.
 
 Implementation adapted for this project from:
 https://github.com/GolpedeRemo37/NafNet-in-AI4Life-Microscopy-Supervised-Denoising-Challenge
@@ -38,6 +38,8 @@ class PatchGANDiscriminator(nn.Module):
     n_layers : int, optional
         Number of convolutional downsampling blocks. Default 4
         (lightweight); use 5 for a deeper discriminator.
+    ndim : int, optional
+        Number of spatial dimensions (2 for 2D, 3 for 3D). Default 2.
 
     Notes
     -----
@@ -48,8 +50,13 @@ class PatchGANDiscriminator(nn.Module):
     4. Final convolution producing a patch-logits map.
     """
 
-    def __init__(self, in_channels=1, base_filters=64, n_layers=4):
+    def __init__(self, in_channels=1, base_filters=64, n_layers=4, ndim=2):
         super(PatchGANDiscriminator, self).__init__()
+        conv = nn.Conv3d if ndim == 3 else nn.Conv2d
+        norm = nn.BatchNorm3d if ndim == 3 else nn.BatchNorm2d
+        
+        # 3D PatchGAN uses kernel size 3 to remain agnostic to small Z dimensions
+        k_size = 3 if ndim == 3 else 4
         
         def discriminator_block(in_filters, out_filters, normalization=True):
             """Create one discriminator stage.
@@ -68,9 +75,9 @@ class PatchGANDiscriminator(nn.Module):
             list[nn.Module]
                 Layers composing one stage of the discriminator.
             """
-            layers = [nn.Conv2d(in_filters, out_filters, 4, stride=2, padding=1)]
+            layers = [conv(in_filters, out_filters, k_size, stride=2, padding=1)]
             if normalization:
-                layers.append(nn.BatchNorm2d(out_filters))
+                layers.append(norm(out_filters))
             layers.append(nn.LeakyReLU(0.2, inplace=True))
             return layers
 
@@ -87,7 +94,7 @@ class PatchGANDiscriminator(nn.Module):
 
         self.model = nn.Sequential(
             *blocks,
-            nn.Conv2d(in_f, 1, 4, stride=1, padding=1)
+            conv(in_f, 1, k_size, stride=1, padding=1)
         )
 
     def forward(self, img):
@@ -96,11 +103,11 @@ class PatchGANDiscriminator(nn.Module):
         Parameters
         ----------
         img : torch.Tensor
-            Input tensor with shape `(N, C, H, W)`.
+            Input tensor with shape `(N, C, H, W)` or `(N, C, D, H, W)`.
 
         Returns
         -------
         torch.Tensor
-            Patch-wise realism logits with shape `(N, 1, H_patch, W_patch)`.
+            Patch-wise realism logits with shape `(N, 1, H_patch, W_patch)` or `(N, 1, D_patch, H_patch, W_patch)`.
         """
         return self.model(img)

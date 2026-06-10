@@ -1204,11 +1204,16 @@ def check_configuration(cfg, jobname, check_data_paths=True):
             opts.extend(["TEST.METRICS", ["mae", "mse"]])
 
         assert len(cfg.TRAIN.METRICS) == 0 or all(
-            [True if x.lower() in ["mae", "mse", "ms_ssim","ms_si_psnr", "lpips" ] else False for x in cfg.TRAIN.METRICS]
-        ), f"'TRAIN.METRICS' options are ['mae', 'mse', 'ms_ssim','ms_si_psnr', 'lpips' ] in {cfg.PROBLEM.TYPE} workflow"
+            [True if x.lower() in ["mae", "mse", "psnr", "si_psnr", "ssim", "ms_ssim"] else False for x in cfg.TRAIN.METRICS]
+        ), f"'TRAIN.METRICS' options are ['mae', 'mse', 'psnr', 'si_psnr', 'ssim', 'ms_ssim'] in {cfg.PROBLEM.TYPE} workflow"
         assert len(cfg.TEST.METRICS) == 0 or all(
-            [True if x.lower() in ["mae", "mse", "ms_ssim","ms_si_psnr", "lpips" ] else False for x in cfg.TEST.METRICS]
-        ), f"'TEST.METRICS' options are ['mae', 'mse', 'ms_ssim','ms_si_psnr', 'lpips' ] in {cfg.PROBLEM.TYPE} workflow"
+            [True if x.lower() in ["mae", "mse", "psnr", "si_psnr", "ssim", "ms_ssim", "ms_si_psnr", "lpips"] else False for x in cfg.TEST.METRICS]
+        ), f"'TEST.METRICS' options are ['mae', 'mse', 'psnr', 'si_psnr', 'ssim', 'ms_ssim', 'ms_si_psnr', 'lpips'] in {cfg.PROBLEM.TYPE} workflow"
+
+        if any([True for x in cfg.TEST.METRICS if x.lower() in ["lpips"]]):
+            if cfg.PROBLEM.NDIM == "3D":
+                raise ValueError("LPIPS metric can only be measured when PROBLEM.NDIM == '2D'")
+
 
     elif cfg.PROBLEM.TYPE == "CLASSIFICATION":
         if set_train_metrics:
@@ -2448,6 +2453,7 @@ def check_configuration(cfg, jobname, check_data_paths=True):
                 "rcan",
                 "hrnet",
                 "stunet",
+                "nafnet"
             ]
             and cfg.PROBLEM.NDIM == "3D"
             and cfg.PROBLEM.TYPE != "CLASSIFICATION"
@@ -2471,6 +2477,7 @@ def check_configuration(cfg, jobname, check_data_paths=True):
                         "rcan",
                         "hrnet",
                         "stunet",
+                        'nafnet'
                     ]
                 )
             )
